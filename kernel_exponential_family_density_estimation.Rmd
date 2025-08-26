@@ -1,0 +1,285 @@
+---
+title: "KEF와 스코어 매칭을 이용한 밀도 추정"
+author: "Taenyoung Lee"
+date: "`r format(Sys.time(), '%Y년 %B %d일')`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = 'center')
+if (!requireNamespace("pracma", quietly = TRUE)) install.packages("pracma")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+if (!requireNamespace("mvtnorm", quietly = TRUE)) install.packages("mvtnorm")
+if (!requireNamespace("viridis", quietly = TRUE)) install.packages("viridis")
+library(pracma)
+library(ggplot2)
+library(mvtnorm)
+library(viridis)
+```
+
+# 1. 모델링
+
+**커널 지수족 (KEF)**은 밀도 함수 $p(x)$를 다음과 같이 정의합니다.
+$$p(x; \alpha) = \frac{1}{Z(\alpha)} \exp\left(\sum_{i=1}^{n} \alpha_i k(x, x_i)\right)$$
+- **목표**: 주어진 데이터 $\{x_1, ..., x_n\}$에 대해 최적의 계수 벡터 $\alpha$를 찾는 것.
+- **커널**: 가우시안 커널 $k(x, y) = \exp(-\frac{\|x-y\|^2}{2\sigma^2})$ 사용.
+
+# 2. 학습 방법: 스코어 매칭
+
+### 왜 스코어 매칭인가?
+최대 가능도 추정(MLE)은 특히 고차원에서 정규화 상수 $Z(\alpha) = \int \exp(\cdot) dx$ 계산이 불가능하여 적용이 어려웠웠습니다. 스코어 매칭은 $Z(\alpha)$ 계산 없이 모델을 학습시키는 기법입니다.
+
+### 목적 함수
+스코어 매칭은 모델의 스코어 함수($\nabla_x \log p(x)$)를 데이터의 스코어 함수에 근사시킵니다. 최소화할 목적 함수는 다음과 같습니다.
+$$J(\alpha) = \mathbb{E}_{\text{data}} \left[ \frac{1}{2} \| \nabla_x f(x; \alpha) \|^2 + \Delta_x f(x; \alpha) \right]$$
+여기서 $f(x; \alpha) = \sum \alpha_i k(x, x_i)$ 이고, $\Delta_x$는 라플라시안 연산자입니다.
+
+### 최적 해
+위 목적 함수는 $\alpha$에 대한 2차식이므로, L2 정규화를 추가하여 미분하면 다음과 같은 선형 방정식으로 해를 구할 수 있습니다.
+$$(M + \lambda K) \alpha = b$$
+학습은 결국 이 방정식을 푸는 과정입니다.
+
+# 3. 하이퍼파라미터
+
+### $\sigma$ (커널 폭)
+- 모델의 유연성을 결정하는 가장 중요한 하이퍼파라미터입니다.
+- 과적합과 과소적합 사이의 최적점을 찾기 위해 **교차 검증(Cross-Validation)**을 사용합니다. CV는 모델의 일반화 성능을 평가하여 최적의 $\sigma$를 선택하는 강건한 방법입니다.
+
+### $\lambda$ (정규화 강도)
+- 모델 성능은 $\sigma$에 훨씬 민감합니다. $\lambda$는 주로 수치적 안정성을 보장하는 역할을 합니다.
+- 계산 효율성을 위해 $\lambda$는 작은 값(`1e-5`)으로 고정하고, 가장 중요한 $\sigma$ 탐색에 집중하는 것이(경험적) 실용적입니다. $\sigma$, $\lambda$를 두개 모두 cross validation으로 튜닝한 것과 큰 차이는 나지 않았습니다.
+
+# 4. 실험 결과
+
+```{r load_script, include=FALSE}
+
+compute_validation_score <- function(X_val, X_train, alpha, sigma) {
+  n_val <- nrow(X_val)
+  n_train <- nrow(X_train)
+  d <- ncol(X_val)
+  total_score <- 0
+  for (i in 1:n_val) {
+    x_i <- X_val[i, , drop=FALSE]
+    D_i <- matrix(x_i, n_train, d, byrow = TRUE) - X_train
+    D2_i <- rowSums(D_i^2)
+    K_i <- exp(-D2_i / (2 * sigma^2))
+    grad_k_i <- -(1/sigma^2) * D_i * K_i
+    grad_f_i <- colSums(alpha * grad_k_i)
+    lap_k_i <- ((D2_i / sigma^4) - d/sigma^2) * K_i
+    lap_f_i <- sum(alpha * lap_k_i)
+    score_i <- 0.5 * sum(grad_f_i^2) + lap_f_i
+    total_score <- total_score + score_i
+  }
+  return(total_score / n_val)
+}
+
+compute_M_b_nd <- function(X, sigma) {
+  n <- nrow(X); d <- ncol(X)
+  Xn <- rowSums(X^2)
+  D2 <- outer(Xn, Xn, "+") - 2 * (X %*% t(X))
+  K  <- exp(-D2 / (2 * sigma^2))
+  M <- matrix(0, n, n)
+  b_vec <- numeric(n)
+  for (i in 1:n) {
+    D_i <- matrix(X[i, ], n, d, byrow = TRUE) - X
+    K_i <- K[i, ]
+    G_i <- -(1/sigma^2) * (D_i * K_i)
+    M <- M + G_i %*% t(G_i)
+    lapK_i <- ((D2[i,] / sigma^4) - d/sigma^2) * K_i
+    b_vec <- b_vec - lapK_i
+  }
+  list(M = M / n, b = b_vec / n, K = K)
+}
+
+fit_kef_nd <- function(X, lambda = 1e-5, k_folds = 5) {
+  n <- nrow(X)
+  dists <- dist(X)
+  median_dist <- median(dists)
+  if(median_dist == 0) median_dist <- 1
+  sigma_grid <- median_dist * seq(0.01, 2, length.out = 15)
+  folds <- sample(cut(seq(1, n), breaks = k_folds, labels = FALSE))
+  cv_scores <- sapply(sigma_grid, function(s) {
+    fold_scores <- sapply(1:k_folds, function(k) {
+      val_idx <- which(folds == k)
+      X_train <- X[-val_idx, , drop=FALSE]
+      X_val <- X[val_idx, , drop=FALSE]
+      n_train <- nrow(X_train)
+      cb_train <- compute_M_b_nd(X_train, s)
+      A_train <- cb_train$M + lambda * cb_train$K + 1e-6 * diag(n_train)
+      alpha <- tryCatch(solve(A_train, cb_train$b), error = function(e) NULL)
+      if (is.null(alpha)) return(NA)
+      compute_validation_score(X_val, X_train, alpha, s)
+    })
+    mean(fold_scores, na.rm = TRUE)
+  })
+  best_sigma_idx <- which.min(cv_scores)
+  if(length(best_sigma_idx) == 0 || !is.finite(cv_scores[best_sigma_idx])) {
+    best_sigma <- median_dist
+  } else {
+    best_sigma <- sigma_grid[best_sigma_idx]
+  }
+  cb_final <- compute_M_b_nd(X, best_sigma)
+  A_final <- cb_final$M + lambda * cb_final$K + 1e-5 * diag(n)
+  alpha_final <- solve(A_final, cb_final$b)
+  list(alpha = alpha_final, sigma = best_sigma, lambda = lambda, X = X)
+}
+
+dens_kef_nd <- function(model, X_new) {
+  X <- model$X; s <- model$sigma
+  Xn1 <- rowSums(X_new^2)
+  Xn2 <- rowSums(X^2)
+  D2  <- outer(Xn1, Xn2, "+") - 2 * (X_new %*% t(X))
+  K   <- exp(-D2 / (2 * s^2))
+  f   <- as.vector(K %*% model$alpha)
+  f   <- f - max(f)
+  exp(f)
+}
+
+eval_kef <- function(X_train, name="Data", X_test=NULL, p_true=NULL, grid_size=100, ...) {
+  d <- ncol(X_train)
+  train_center <- colMeans(X_train)
+  train_scale <- apply(X_train, 2, sd)
+  train_scale[train_scale == 0] <- 1
+  X_train_scaled <- scale(X_train, center = train_center, scale = train_scale)
+  model <- fit_kef_nd(X_train_scaled, ...)
+  cat(sprintf("%s (%dD): Optimal sigma (scaled) = %.3f\n", name, d, model$sigma))
+  
+  if (d == 1) {
+    range_x <- range(X_train[,1])
+    xg_orig <- seq(range_x[1] - diff(range_x)*0.15, range_x[2] + diff(range_x)*0.15, length.out = 200)
+    xg_scaled <- scale(as.matrix(xg_orig), center = train_center, scale = train_scale)
+    p_unn_scaled <- dens_kef_nd(model, xg_scaled)
+    p_hat_scaled <- p_unn_scaled / trapz(xg_scaled[,1], p_unn_scaled)
+    p_hat_orig <- p_hat_scaled / train_scale[1]
+    df_est  <- data.frame(x = xg_orig, density = p_hat_orig)
+    df_dat  <- data.frame(x = X_train[,1])
+    p <- ggplot(df_dat, aes(x)) +
+      geom_histogram(aes(y = after_stat(density)), bins=30, fill="grey80", color="white") +
+      geom_line(data = df_est, aes(x = x, y = density), linewidth=1, color="royalblue") +
+      labs(title = name) + theme_minimal()
+    print(p)
+  } else if (d == 2) {
+    range_x <- range(X_train[,1]); range_y <- range(X_train[,2])
+    xs <- seq(range_x[1] - diff(range_x)*0.1, range_x[2] + diff(range_x)*0.1, length.out = grid_size)
+    ys <- seq(range_y[1] - diff(range_y)*0.1, range_y[2] + diff(range_y)*0.1, length.out = grid_size)
+    grd_orig <- expand.grid(x = xs, y = ys)
+    grd_scaled <- scale(grd_orig, center = train_center, scale = train_scale)
+    p_unn_scaled <- dens_kef_nd(model, as.matrix(grd_scaled))
+    dx_scaled <- (xs[2] - xs[1]) / train_scale[1]
+    dy_scaled <- (ys[2] - ys[1]) / train_scale[2]
+    C_scaled <- sum(p_unn_scaled) * dx_scaled * dy_scaled
+    p_hat_orig <- (p_unn_scaled / C_scaled) / (train_scale[1] * train_scale[2])
+    df <- cbind(grd_orig, density = p_hat_orig)
+    df_points <- as.data.frame(X_train); names(df_points) <- c("x", "y")
+    p <- ggplot(df, aes(x = x, y = y)) +
+      geom_raster(aes(fill = density)) +
+      geom_contour(aes(z = density), color = "white", alpha=0.5) +
+      scale_fill_viridis_c() +
+      geom_point(data=df_points, shape=21, fill="white", color="black", alpha=0.5, size=2) +
+      labs(title = name) + theme_minimal() + coord_fixed(ratio = 1)
+    print(p)
+  } else { # d >= 3
+    if (is.null(X_test) || is.null(p_true)) stop("For d>=3, X_test and p_true are required.")
+    X_test_scaled <- scale(X_test, center = train_center, scale = train_scale)
+    p_unn_scaled <- dens_kef_nd(model, X_test_scaled)
+    p_hat_orig <- (p_unn_scaled / sum(p_unn_scaled)) / prod(train_scale) # Simplified normalization
+    p_t  <- if (is.function(p_true)) p_true(X_test) else p_true
+    MISE <- mean((p_hat_orig/sum(p_hat_orig) - p_t/sum(p_t))^2)
+    cat(sprintf(" -> Monte Carlo MISE = %.5g\n", MISE))
+    return(invisible(list(model = model, MISE=MISE)))
+  }
+}
+```
+
+### 4.1. 1D 데이터
+```{r run_1d, fig.width=10, fig.height=4}
+
+set.seed(101)
+X1_mix <- matrix(c(rnorm(150, -2, 0.7), rnorm(150, 2, 0.7)), ncol = 1)
+eval_kef(X1_mix, name = "1D Bimodal Mixture")
+
+set.seed(102)
+X1_gamma <- matrix(rgamma(300, shape = 2, rate = 1.5), ncol = 1)
+eval_kef(X1_gamma, name = "1D Gamma (Asymmetric)")
+
+set.seed(111)
+X1_tri <- matrix(c(rnorm(150, -2, 0.6),
+                   rnorm(100,  0, 1.0),
+                   rnorm(150,  3, 0.8)), ncol = 1)
+eval_kef(X1_tri, name = "1D Triple Gaussian")
+
+set.seed(112)
+X1_t <- matrix(rt(300, df = 3), ncol = 1)
+eval_kef(X1_t, name = "1D Student-t(ν=3)")
+```
+
+### 4.2. 2D 데이터
+```{r run_2d, fig.width=10, fig.height=4}
+set.seed(201)
+n_banana <- 400
+x_b <- rnorm(n_banana, 0, 1.5)
+y_b <- x_b^2 + rnorm(n_banana, 0, 0.8)
+X2_banana <- cbind(x_b, y_b)
+eval_kef(X2_banana, name = "2D Banana Shape")
+
+set.seed(202)
+n_ring <- 300
+radius <- rnorm(n_ring, mean = 3, sd = 0.3)
+angle <- runif(n_ring, 0, 2 * pi)
+x_r <- radius * cos(angle)
+y_r <- radius * sin(angle)
+X2_ring <- cbind(x_r, y_r)
+eval_kef(X2_ring, name = "2D Ring Shape")
+
+set.seed(203)
+X2_cluster <- rbind(
+  rmvnorm(100, mean = c(-1.5, 1.5), sigma = diag(2) * 0.4),
+  rmvnorm(100, mean = c(1.5, 1.5), sigma = diag(2) * 0.4),
+  rmvnorm(180, mean = c(0, -1.5), sigma = diag(2) * 0.4)
+)
+eval_kef(X2_cluster, name = "2D Three Clusters")
+
+
+set.seed(211)
+n_moon <- 500
+theta  <- runif(n_moon, 0, pi)
+
+moon1 <- cbind(cos(theta),  sin(theta)) +
+         matrix(rnorm(2*n_moon, 0, 0.1), ncol = 2)
+moon2 <- cbind(1 - cos(theta), -sin(theta) + 0.5) +
+         matrix(rnorm(2*n_moon, 0, 0.1), ncol = 2)
+
+X2_moons <- rbind(moon1, moon2)
+eval_kef(X2_moons, name = "2D Two Moons (flipped)")
+
+set.seed(212)
+n_plus <- 500
+x_axis <- cbind(rnorm(n_plus, 0, 1.2), rnorm(n_plus, 0, 0.2))
+y_axis <- cbind(rnorm(n_plus, 0, 0.2), rnorm(n_plus, 0, 1.2))
+X2_plus <- rbind(x_axis, y_axis)
+eval_kef(X2_plus, name = "2D Plus Shape")
+```
+
+### 4.3. 3D 데이터 (MISE 평가)
+```{r run_3d}
+set.seed(301)
+mean1 <- rep(0, 3); cov1 <- diag(3)
+mean2 <- rep(4, 3); cov2 <- matrix(c(1,0.8,0.8, 0.8,1,0.8, 0.8,0.8,1), 3)
+X3_train <- rbind(rmvnorm(150, mean1, cov1), rmvnorm(150, mean2, cov2))
+X3_test <- rbind(rmvnorm(500, mean1, cov1), rmvnorm(500, mean2, cov2))
+p_true_fun <- function(X) { 0.5 * dmvnorm(X, mean1, cov1) + 0.5 * dmvnorm(X, mean2, cov2) }
+eval_kef(X3_train, name = "3D Correlated Mixture", X_test = X3_test, p_true = p_true_fun)
+```
+
+# 5. 참고문헌
+
+
+1.  **Hyvärinen, A. (2005).** *Estimation of Non-Normalized Statistical Models by Score Matching*. Journal of Machine Learning Research, 6, 695-709.
+    
+2.  **Li Wenliang, Danica J. Sutherland, Heiko Strathmann, Arthur Gretton. (2019).** *Learning Deep Kernels for Exponential Family Densities*. In Proceedings of Machine Learning Research (PMLR).
+    
