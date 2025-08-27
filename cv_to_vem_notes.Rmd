@@ -1,6 +1,6 @@
 ---
 title: "CV를 넘어 VEM으로: 커널 밀도 추정의 원리와 완전 자동화"
-author: "AI 튜터"
+author: "tae"
 date: "`r format(Sys.Date())`"
 output:
   html_document:
