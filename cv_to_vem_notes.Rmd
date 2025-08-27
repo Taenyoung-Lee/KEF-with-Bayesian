@@ -200,7 +200,7 @@ grad_sigma_lap_x_rbf <- function(x, y, sigma) {
 
 ### 4.3. VEM 알고리즘 구현: 핵심 루프
 
-오류를 수정한 `compute_Kb` 함수와 전체 VEM 알고리즘 루프입니다. 각 단계에 상세한 주석을 추가하여 코드의 흐름을 쉽게 따라갈 수 있도록 했습니다.
+ `compute_Kb` 함수와 전체 VEM 알고리즘 루프입니다. 
 
 ```{r vem-implementation-fixed}
 # K_sigma 와 b_sigma 및 그 도함수들을 계산하는 함수
@@ -279,10 +279,14 @@ run_vem <- function(X_data, basis_pts, n_iters = 50, lr_sigma = 0.01) {
     tau2 <- (sum(diag(S)) + sum(m^2)) / M
     
     # 2. beta 업데이트 (모델 신뢰도 자동 조절)
-    numerator <- 2 * t(b_sigma) %*% m
-    denominator <- sum(diag(K_sigma %*% S)) + t(m) %*% K_sigma %*% m
-    beta <- as.numeric(numerator / denominator)
+    #numerator <- 2 * t(b_sigma) %*% m
+    #denominator <- sum(diag(K_sigma %*% S)) + t(m) %*% K_sigma %*% m
+    #beta <- as.numeric(numerator / denominator)
+    # 1. 먼저 예측 오차의 기댓값 E[J(w)]를 계산합니다.
+    expected_error <- 0.5 * (sum(diag(K_sigma %*% S)) + t(m) %*% K_sigma %*% m) - t(b_sigma) %*% m
     
+    # 2. beta를 기댓값의 역수로 업데이트합니다. (오차가 0이 되는 경우 방지)
+    beta <- 1 / max(expected_error, 1e-6) 
     # 3. sigma 업데이트 (경사 상승법)
     # ELBO의 sigma에 대한 그래디언트 계산
     grad_L_sigma <- -0.5 * beta * (sum(diag(derivs$dK_dsigma %*% S)) + t(m) %*% derivs$dK_dsigma %*% m) +
