@@ -36,7 +36,7 @@ knitr::opts_chunk$set(
 - 본 구현에서는 수치 안정화를 위해 \(A := H + \lambda K + \epsilon I\)를 사용하고, 
   \[\alpha^* = -\frac{1}{T} A^{-1} b.\]
 - Empirical Bayes(Variational EM)로 \(\sigma, \lambda\)를 **ELBO 최대화**로 갱신합니다.
-
+- \[ \log p = f + \log{p_0} \]로 놔야 sm-kef에서 쓰는 방식. - 참고문헌 정리
 # 구현
 
 ## 유틸리티 함수 
