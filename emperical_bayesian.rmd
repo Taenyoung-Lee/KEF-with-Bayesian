@@ -39,7 +39,7 @@ knitr::opts_chunk$set(
 
 # 구현
 
-## 유틸리티 함수
+## 유틸리티 함수 
 
 ```{r}
 safe_chol <- function(M) {
@@ -164,6 +164,53 @@ elbo_value <- function(K, H, b, lambda, epsilon) {
   fit_term <- 0.5 * as.numeric(crossprod(b, Ainv_b)) / (Tn^2)
   prior_term + model_term + fit_term
 }
+```
+
+
+## gradient
+
+```{r}
+# dL/dsigma
+grad_sigma_elbo <- function(K, H, b, lambda, epsilon, dK, dH, db) {
+  Tn <- length(b)
+  Q <- lambda * K + diag(epsilon, Tn)
+  A <- H + Q
+  dQ <- lambda * dK
+  dA <- dH + dQ
+
+  LQ <- safe_chol(Q)
+  LA <- safe_chol(A)
+
+  tr_Qinv_dQ <- sum(diag(chol_solve(LQ, dQ)))
+  tr_Ainv_dA <- sum(diag(chol_solve(LA, dA)))
+
+  Ainv_b <- chol_solve(LA, b)
+  tmp <- chol_solve(LA, dA %*% Ainv_b)
+  quad <- as.numeric(crossprod(b, tmp))
+
+  0.5 * tr_Qinv_dQ - 0.5 * tr_Ainv_dA +
+    (1 / (2 * Tn^2)) * (2 * sum(db * Ainv_b) - quad)
+}
+# dL/dlambda
+grad_lambda_elbo <- function(K, H, b, lambda, epsilon) {
+  Tn <- length(b)
+  Q <- lambda * K + diag(epsilon, Tn)
+  A <- H + Q
+
+  LQ <- safe_chol(Q)
+  LA <- safe_chol(A)
+
+  tr1 <- sum(diag(chol_solve(LQ, K)))
+  tr2 <- sum(diag(chol_solve(LA, K)))
+
+  Ainv_b <- chol_solve(LA, b)
+  quad <- as.numeric(crossprod(Ainv_b, K %*% Ainv_b))
+
+  0.5 * tr1 - 0.5 * tr2 - (1 / (2 * Tn^2)) * quad
+}
+
+
+
 ```
 
 ## 사후 평균(폐형식 해)
@@ -312,6 +359,20 @@ kef_predict_unnormalized_density <- function(fit, Xnew) {
 # 데모 (1D 혼합 정규)
 
 ```{r}
+# --- 1D normalization helper ---
+dens1d_norm_from_logf <- function(xs, logf) {
+  m <- max(logf); u <- exp(logf - m)
+  dx <- diff(xs)
+  if (length(dx) < 1) stop("xs needs length >= 2")
+  if (max(abs(diff(dx))) < 1e-12) {
+    Z <- sum(u) * dx[1]
+  } else {
+    Z <- sum((u[-1] + u[-length(u)]) / 2 * dx)  # trapezoid
+  }
+  u / Z
+}
+
+
 set.seed(42)
 n <- 200
 X <- c(rnorm(n/2, -3, 0.6), rnorm(n/2, 3, 0.9))
@@ -331,16 +392,16 @@ print(list(sigma = fit$sigma, lambda = fit$lambda,
            ELBO = fit$elbo))
 
 xs <- seq(min(X) - 3, max(X) + 3, length.out = 400)
-dens_u <- kef_predict_unnormalized_density(fit, xs)
+dens1d_eb <- function(fit, xs) dens1d_norm_from_logf(xs, kef_predict_f(fit, xs))
+
+dens <- dens1d_eb(fit, xs)
 
 op <- par(no.readonly = TRUE); on.exit(par(op))
 hist(X, breaks = 30, freq = FALSE,
-     main = "KEF + Score Matching (unnormalized density)",
-     xlab = "x", ylab = "density (unnorm)",
+     main = "KEF + Score Matching (normalized density)",
+     xlab = "x", ylab = "density",
      col = "grey90", border = "white")
-lines(xs,
-      dens_u / max(dens_u) * max(hist(X, breaks = 30, plot = FALSE)$density),
-      lwd = 2)
+lines(xs, dens, lwd = 2)
 ```
 
 # 요약
