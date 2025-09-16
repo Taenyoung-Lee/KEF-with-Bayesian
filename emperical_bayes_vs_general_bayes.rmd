@@ -1,0 +1,541 @@
+---
+title: "KEF + Score Matching: EB (τ=1) vs GBI (τ optimized): 18 Datasets"
+author: "Taenyoung Lee"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    toc_float: true
+    df_print: paged
+    code_folding: show
+    theme: readable
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 7, fig.height = 4.6
+)
+set.seed(1)
+```
+
+# 공통 유틸리티 & 수식 구성 요소 (공유)
+
+```{r}
+# --------- Linear algebra helpers ---------
+safe_chol <- function(M) {
+  base <- mean(diag(M))
+  eps  <- if (is.finite(base) && base > 0) 1e-10 * base else 1e-10
+  for (k in 0:8) {
+    out <- try(chol(M + diag(eps, nrow(M))), silent = TRUE)
+    if (!inherits(out, "try-error")) return(out)
+    eps <- eps * 10
+  }
+  stop("Cholesky failed. Matrix might be ill-conditioned.")
+}
+chol_solve <- function(L, B) {
+  y <- forwardsolve(t(L), B, upper.tri = FALSE, transpose = FALSE)
+  x <- backsolve(L, y, transpose = FALSE)
+  x
+}
+logdet_from_chol <- function(L) 2 * sum(log(diag(L)))
+
+# --------- RBF kernel & derivatives ---------
+rbf_kernel <- function(X, sigma) {
+  D2 <- as.matrix(dist(X, method = "euclidean"))^2
+  exp(- D2 / (2 * sigma^2))
+}
+# ∇_x k at x = x_t, columns = all i
+grad_k_at <- function(x_t, X, sigma) {
+  diff <- matrix(x_t, nrow = nrow(X), ncol = ncol(X), byrow = TRUE) - X
+  r2   <- rowSums(diff^2)
+  kvec <- exp(- r2 / (2 * sigma^2))
+  Gcols <- - (diff / sigma^2) * kvec
+  t(Gcols)
+}
+# Δ_x k at x = x_t, vector over i
+laplacian_k_at <- function(x_t, X, sigma) {
+  d <- ncol(X)
+  diff <- matrix(x_t, nrow = nrow(X), ncol = ncol(X), byrow = TRUE) - X
+  r2 <- rowSums(diff^2)
+  kvec <- exp(- r2 / (2 * sigma^2))
+  (-d / sigma^2 + r2 / sigma^4) * kvec
+}
+# σ-derivatives (for σ updates)
+dK_dsigma <- function(X, sigma, K_precomp = NULL) {
+  if (is.null(K_precomp)) K_precomp <- rbf_kernel(X, sigma)
+  D2 <- as.matrix(dist(X, method = "euclidean"))^2
+  K_precomp * (D2 / sigma^3)
+}
+dgrad_k_dsigma_at <- function(x_t, X, sigma) {
+  diff <- matrix(x_t, nrow = nrow(X), ncol = ncol(X), byrow = TRUE) - X
+  r2   <- rowSums(diff^2)
+  kvec <- exp(- r2 / (2 * sigma^2))
+  factor <- (2 / sigma^3) - (r2 / sigma^5)
+  Gsig_cols <- diff * (kvec * factor)
+  t(Gsig_cols)
+}
+dlap_k_dsigma_at <- function(x_t, X, sigma) {
+  d <- ncol(X)
+  diff <- matrix(x_t, nrow = nrow(X), ncol = ncol(X), byrow = TRUE) - X
+  r2   <- rowSums(diff^2)
+  kvec <- exp(- r2 / (2 * sigma^2))
+  kvec * ( (2*d)/sigma^3 - ((d+4)*r2)/sigma^5 + (r2^2)/sigma^7 )
+}
+
+# --------- Build H, b, (and σ-derivs) ---------
+build_mats <- function(X, sigma) {
+  Tn <- nrow(X)
+  K <- rbf_kernel(X, sigma)
+  H <- matrix(0, Tn, Tn)
+  b <- numeric(Tn)
+  for (t in 1:Tn) {
+    Gt <- grad_k_at(X[t, , drop = FALSE], X, sigma)     # d x T
+    H  <- H + crossprod(Gt)                             # T x T
+    b  <- b + laplacian_k_at(X[t, , drop = FALSE], X, sigma)
+  }
+  H <- H / Tn
+  list(K = K, H = H, b = b)
+}
+build_sigma_derivs <- function(X, sigma, K = NULL) {
+  Tn <- nrow(X)
+  if (is.null(K)) K <- rbf_kernel(X, sigma)
+  dK <- dK_dsigma(X, sigma, K)
+  dH <- matrix(0, Tn, Tn)
+  db <- numeric(Tn)
+  for (t in 1:Tn) {
+    dGt <- dgrad_k_dsigma_at(X[t, , drop = FALSE], X, sigma)
+    dH  <- dH + crossprod(dGt)
+    db  <- db + dlap_k_dsigma_at(X[t, , drop = FALSE], X, sigma)
+  }
+  dH <- dH / Tn
+  list(dK = dK, dH = dH, db = db)
+}
+```
+
+# 방법 2: EB/VEM (τ=1 고정, jitter = ε 고정)
+
+```{r}
+# ELBO with Q = lambda*K + eps*I, A = H + Q
+en_elbo_value <- function(K, H, b, lambda, eps) {
+  Tn <- length(b)
+  Q <- lambda * K + diag(eps, Tn)
+  A <- H + Q
+  LQ <- safe_chol(Q); LA <- safe_chol(A)
+  0.5*logdet_from_chol(LQ) - 0.5*logdet_from_chol(LA) +
+    0.5 * as.numeric(crossprod(b, chol_solve(LA, b))) / (Tn^2)
+}
+# grads wrt sigma & lambda
+en_grad_sigma <- function(K, H, b, lambda, eps, dK, dH, db) {
+  Tn <- length(b)
+  Q <- lambda*K + diag(eps, Tn); A <- H + Q
+  LQ <- safe_chol(Q); LA <- safe_chol(A)
+  dQ <- lambda*dK; dA <- dH + dQ
+  tr_Q <- sum(diag(chol_solve(LQ, dQ)))
+  tr_A <- sum(diag(chol_solve(LA, dA)))
+  Ainv_b <- chol_solve(LA, b)
+  tmp <- chol_solve(LA, dA %*% Ainv_b)
+  0.5*tr_Q - 0.5*tr_A + (1/(2*Tn^2))*(2*sum(db*Ainv_b) - as.numeric(crossprod(b, tmp)))
+}
+en_grad_lambda <- function(K, H, b, lambda, eps) {
+  Tn <- length(b)
+  Q <- lambda*K + diag(eps, Tn); A <- H + Q
+  LQ <- safe_chol(Q); LA <- safe_chol(A)
+  tr1 <- sum(diag(chol_solve(LQ, K)))
+  tr2 <- sum(diag(chol_solve(LA, K)))
+  Ainv_b <- chol_solve(LA, b)
+  0.5*tr1 - 0.5*tr2 - (1/(2*Tn^2))*as.numeric(crossprod(Ainv_b, K %*% Ainv_b))
+}
+# closed-form posterior mean alpha (EB)
+solve_alpha_eb <- function(H, K, b, lambda, eps, Tn){
+  A <- H + lambda*K + diag(eps, Tn)
+  LA <- safe_chol(A)
+  alpha <- -(1/Tn) * chol_solve(LA, b)
+  list(alpha = alpha, cholA = LA)
+}
+# fit (σ, λ), ε fixed
+ebf_fit <- function(X, sigma_init=NULL, lambda_init=1.0, eps=1e-6,
+                    max_iter=200, tol=1e-4, step_sigma=0.3, step_lambda=0.3,
+                    standardize=TRUE, sigma_clip_factor=c(0.2,5.0),
+                    lambda_bounds=c(1e-8,1e6), verbose=FALSE){
+  X <- as.matrix(X); Tn <- nrow(X); d <- ncol(X)
+  if (standardize){ x_center <- colMeans(X); x_scale <- apply(X,2,sd);
+    x_scale[!is.finite(x_scale)|x_scale==0] <- 1
+    X <- scale(X, center=x_center, scale=x_scale)
+  } else { x_center <- rep(0,d); x_scale <- rep(1,d) }
+  D <- as.matrix(dist(X)); med_d <- median(D[D>0]); if(!is.finite(med_d)||med_d<=0) med_d <- 1
+  smin <- sigma_clip_factor[1]*med_d; smax <- sigma_clip_factor[2]*med_d
+  sigma <- if(is.null(sigma_init)) med_d else sigma_init
+  sigma <- min(max(sigma,smin),smax); lnsigma <- log(sigma)
+  lambda <- min(max(lambda_init, lambda_bounds[1]), lambda_bounds[2]); lnlambda <- log(lambda)
+  mats <- build_mats(X, sigma)
+  Lcur <- en_elbo_value(mats$K, mats$H, mats$b, lambda, eps)
+  for (it in 1:max_iter){
+    improved <- FALSE
+    gl <- en_grad_lambda(mats$K, mats$H, mats$b, lambda, eps)
+    g <- lambda*gl; if(!is.finite(g)) g <- 0; step <- step_lambda
+    for (ls in 1:20){
+      lambda_try <- exp(lnlambda + step*g)
+      lambda_try <- min(max(lambda_try, lambda_bounds[1]), lambda_bounds[2])
+      Ltry <- en_elbo_value(mats$K, mats$H, mats$b, lambda_try, eps)
+      if (is.finite(Ltry) && Ltry >= Lcur - 1e-12){ lambda <- lambda_try; lnlambda<-log(lambda); Lcur<-Ltry; improved<-TRUE; break } else step <- step/2
+    }
+    ders <- build_sigma_derivs(X, sigma, K=mats$K)
+    gs <- en_grad_sigma(mats$K, mats$H, mats$b, lambda, eps, ders$dK, ders$dH, ders$db)
+    g <- sigma*gs; if(!is.finite(g)) g <- 0; step <- step_sigma
+    for (ls in 1:20){
+      sigma_try <- exp(lnsigma + step*g)
+      sigma_try <- min(max(sigma_try, smin), smax)
+      mats_try <- build_mats(X, sigma_try)
+      Ltry <- en_elbo_value(mats_try$K, mats_try$H, mats_try$b, lambda, eps)
+      if (is.finite(Ltry) && Ltry >= Lcur - 1e-12){ sigma<-sigma_try; lnsigma<-log(sigma); mats<-mats_try; Lcur<-Ltry; improved<-TRUE; break } else step <- step/2
+    }
+    if (!improved || step_sigma*abs(g) < tol) break
+  }
+  sol <- solve_alpha_eb(mats$H, mats$K, mats$b, lambda, eps, Tn)
+  list(X=X, sigma=sigma, lambda=lambda, eps=eps, elbo=Lcur, alpha=sol$alpha,
+       H=mats$H, K=mats$K, b=mats$b, x_center=if(exists("x_center")) x_center else NULL,
+       x_scale=if(exists("x_scale")) x_scale else NULL, standardize=standardize)
+}
+# predict (EB)
+predict_f_eb <- function(fit, Xnew){
+  Xnew <- as.matrix(Xnew)
+  if (isTRUE(fit$standardize)){
+    Xnew <- sweep(Xnew, 2, fit$x_center, "-")
+    Xnew <- sweep(Xnew, 2, fit$x_scale,  "/")
+  }
+  Tn <- nrow(fit$X); out <- matrix(0, nrow(Xnew), Tn)
+  for (i in 1:nrow(Xnew)){
+    diff <- sweep(fit$X, 2, Xnew[i,], FUN="-"); r2 <- rowSums(diff^2)
+    out[i,] <- exp(- r2 / (2 * fit$sigma^2))
+  }
+  as.numeric(out %*% fit$alpha)
+}
+predict_den_eb <- function(fit, Xnew) exp(predict_f_eb(fit, Xnew))
+```
+
+# 방법 1: GBI (τ 최적화, jitter = ε 고정)
+
+```{r}
+# GBI ELBO with Q=lambda*K+eps*I, R=tau*H + Q
+GBI_elbo <- function(K, H, b, lambda, tau, eps){
+  Tn <- length(b)
+  Q <- lambda*K + diag(eps, Tn)
+  R <- tau*H + Q
+  LQ <- safe_chol(Q); LR <- safe_chol(R)
+  0.5*logdet_from_chol(LQ) - 0.5*logdet_from_chol(LR) +
+    0.5 * (tau^2/Tn^2) * as.numeric(crossprod(b, chol_solve(LR, b)))
+}
+# grads
+gbi_grad_lambda <- function(K, H, b, lambda, tau, eps){
+  Tn <- length(b)
+  Q <- lambda*K + diag(eps,Tn); R <- tau*H + Q
+  LQ <- safe_chol(Q); LR <- safe_chol(R)
+  tr1 <- sum(diag(chol_solve(LQ, K)))
+  tr2 <- sum(diag(chol_solve(LR, K)))
+  Rinv_b <- chol_solve(LR, b)
+  0.5*tr1 - 0.5*tr2 - 0.5*(tau^2/Tn^2)*as.numeric(crossprod(Rinv_b, K %*% Rinv_b))
+}
+gbi_grad_tau <- function(K, H, b, lambda, tau, eps){
+  Tn <- length(b)
+  Q <- lambda*K + diag(eps,Tn); R <- tau*H + Q
+  LR <- safe_chol(R)
+  tr_Rinv_H <- sum(diag(chol_solve(LR, H)))
+  Rinv_b <- chol_solve(LR, b)
+  bRinvb <- as.numeric(crossprod(b, Rinv_b))
+  quad_H  <- as.numeric(crossprod(Rinv_b, H %*% Rinv_b))
+  -0.5*tr_Rinv_H + (tau/Tn^2)*bRinvb - 0.5*(tau^2/Tn^2)*quad_H
+}
+gbi_grad_sigma <- function(K, H, b, lambda, tau, eps, dK, dH, db){
+  Tn <- length(b)
+  Q <- lambda*K + diag(eps,Tn); R <- tau*H + Q
+  LQ <- safe_chol(Q); LR <- safe_chol(R)
+  dQ <- lambda*dK; dR <- tau*dH + dQ
+  tr_Q <- sum(diag(chol_solve(LQ, dQ)))
+  tr_R <- sum(diag(chol_solve(LR, dR)))
+  Rinv_b <- chol_solve(LR, b)
+  tmp    <- chol_solve(LR, dR %*% Rinv_b)
+  0.5*tr_Q - 0.5*tr_R + (tau^2/(2*Tn^2))*(2*sum(db*Rinv_b) - as.numeric(crossprod(b, tmp)))
+}
+# posterior mean m = -(tau/T) R^{-1} b
+solve_post_gbi <- function(H, K, b, lambda, tau, eps, Tn){
+  R <- tau*H + lambda*K + diag(eps, Tn)
+  LR <- safe_chol(R)
+  m <- -(tau/Tn) * chol_solve(LR, b)
+  list(m=m, cholR=LR)
+}
+# fit (σ, λ, τ)
+fit_gbi <- function(X, sigma_init=NULL, lambda_init=1.0, tau_init=1.0, eps=1e-6,
+                    max_iter=200, tol=1e-4, step_sigma=0.2, step_lambda=0.2, step_tau=0.2,
+                    standardize=TRUE, sigma_clip_factor=c(0.2,5.0),
+                    lambda_bounds=c(1e-8,1e6), tau_bounds=c(1e-3,1e3), verbose=FALSE){
+  X <- as.matrix(X); Tn <- nrow(X); d <- ncol(X)
+  if (standardize){ x_center <- colMeans(X); x_scale <- apply(X,2,sd);
+    x_scale[!is.finite(x_scale)|x_scale==0] <- 1; X <- scale(X, center=x_center, scale=x_scale)
+  } else { x_center <- rep(0,d); x_scale <- rep(1,d) }
+  D <- as.matrix(dist(X)); med_d <- median(D[D>0]); if(!is.finite(med_d)||med_d<=0) med_d <- 1
+  smin <- sigma_clip_factor[1]*med_d; smax <- sigma_clip_factor[2]*med_d
+  sigma <- if(is.null(sigma_init)) med_d else sigma_init
+  sigma <- min(max(sigma,smin),smax); lnsigma <- log(sigma)
+  lambda <- min(max(lambda_init, lambda_bounds[1]), lambda_bounds[2]); lnlambda <- log(lambda)
+  tau <- min(max(tau_init, tau_bounds[1]), tau_bounds[2]); lntau <- log(tau)
+  mats <- build_mats(X, sigma)
+  Lcur <- GBI_elbo(mats$K, mats$H, mats$B <- mats$b, lambda, tau, eps)
+  for (it in 1:max_iter){
+    improved <- FALSE
+    gl <- gbi_grad_lambda(mats$K, mats$H, mats$b, lambda, tau, eps)
+    g <- lambda*gl; if(!is.finite(g)) g <- 0; step <- step_lambda
+    for (ls in 1:20){
+      lambda_try <- exp(lnlambda + step*g)
+      lambda_try <- min(max(lambda_try, lambda_bounds[1]), lambda_bounds[2])
+      Ltry <- GBI_elbo(mats$K, mats$H, mats$b, lambda_try, tau, eps)
+      if (is.finite(Ltry) && Ltry >= Lcur - 1e-12){ lambda<-lambda_try; lnlambda<-log(lambda); Lcur<-Ltry; improved<-TRUE; break } else step <- step/2
+    }
+    gt <- gbi_grad_tau(mats$K, mats$H, mats$b, lambda, tau, eps)
+    g <- tau*gt; if(!is.finite(g)) g <- 0; step <- step_tau
+    for (ls in 1:20){
+      tau_try <- exp(lntau + step*g)
+      tau_try <- min(max(tau_try, tau_bounds[1]), tau_bounds[2])
+      Ltry <- GBI_elbo(mats$K, mats$H, mats$b, lambda, tau_try, eps)
+      if (is.finite(Ltry) && Ltry >= Lcur - 1e-12){ tau<-tau_try; lntau<-log(tau); Lcur<-Ltry; improved<-TRUE; break } else step <- step/2
+    }
+    ders <- build_sigma_derivs(X, sigma, K=mats$K)
+    gs <- gbi_grad_sigma(mats$K, mats$H, mats$b, lambda, tau, eps, ders$dK, ders$dH, ders$db)
+    g <- sigma*gs; if(!is.finite(g)) g <- 0; step <- step_sigma
+    for (ls in 1:20){
+      sigma_try <- exp(lnsigma + step*g)
+      sigma_try <- min(max(sigma_try, smin), smax)
+      mats_try <- build_mats(X, sigma_try)
+      Ltry <- GBI_elbo(mats_try$K, mats_try$H, mats_try$b, lambda, tau, eps)
+      if (is.finite(Ltry) && Ltry >= Lcur - 1e-12){ sigma<-sigma_try; lnsigma<-log(sigma); mats<-mats_try; Lcur<-Ltry; improved<-TRUE; break } else step <- step/2
+    }
+    if (!improved || step_sigma*abs(g) < tol) break
+  }
+  post <- solve_post_gbi(mats$H, mats$K, mats$b, lambda, tau, eps, Tn)
+  list(X=X, sigma=sigma, lambda=lambda, tau=tau, eps=eps, elbo=Lcur, m=post$m,
+       H=mats$H, K=mats$K, b=mats$b, x_center=x_center, x_scale=x_scale, standardize=standardize)
+}
+# predict (GBI)
+predict_f_gbi <- function(fit, Xnew){
+  Xnew <- as.matrix(Xnew)
+  if (isTRUE(fit$standardize)){
+    Xnew <- sweep(Xnew, 2, fit$x_center, "-")
+    Xnew <- sweep(Xnew, 2, fit$x_scale,  "/")
+  }
+  Tn <- nrow(fit$X); out <- matrix(0, nrow(Xnew), Tn)
+  for (i in 1:nrow(Xnew)){
+    diff <- sweep(fit$X, 2, Xnew[i,], FUN="-"); r2 <- rowSums(diff^2)
+    out[i,] <- exp(- r2 / (2 * fit$sigma^2))
+  }
+  as.numeric(out %*% fit$m)
+}
+predict_den_gbi <- function(fit, Xnew) exp(predict_f_gbi(fit, Xnew))
+```
+
+# 1D 데이터 (4개) — EB vs GBI
+
+> 공통 평가 함수를 **사용하지 않고**, 각 데이터마다 **방법2(EB)**와 **방법1(GBI)** 순서로 별도 코드 청크를 제공합니다.
+
+## 1D Bimodal Mixture
+
+```{r}
+set.seed(101)
+X1_mix <- matrix(c(rnorm(150, -2, 0.7), rnorm(150, 2, 0.7)), ncol = 1)
+# EB
+fit_eb <- ebf_fit(X1_mix, eps=1e-6, verbose=TRUE)
+xs <- seq(min(X1_mix)-3, max(X1_mix)+3, length.out=400)
+d_eb <- predict_den_eb(fit_eb, xs)
+# GBI
+fit_gb <- fit_gbi(X1_mix, eps=1e-6, verbose=TRUE)
+d_gb <- predict_den_gbi(fit_gb, xs)
+par(mfrow=c(1,2))
+hist(X1_mix, breaks=30, freq=FALSE, main="EB (τ=1)", xlab="x", col="grey90", border="white")
+lines(xs, d_eb/max(d_eb)*max(hist(X1_mix, breaks=30, plot=FALSE)$density), lwd=2)
+hist(X1_mix, breaks=30, freq=FALSE, main="GBI (τ optimized)", xlab="x", col="grey90", border="white")
+lines(xs, d_gb/max(d_gb)*max(hist(X1_mix, breaks=30, plot=FALSE)$density), lwd=2)
+par(mfrow=c(1,1))
+```
+
+## 1D Gamma (Asymmetric)
+
+```{r}
+set.seed(102)
+X1_gamma <- matrix(rgamma(300, shape = 2, rate = 1.5), ncol = 1)
+# EB
+fit_eb <- ebf_fit(X1_gamma, eps=1e-6, verbose=TRUE)
+xs <- seq(min(X1_gamma)-1, max(X1_gamma)+1, length.out=400)
+d_eb <- predict_den_eb(fit_eb, xs)
+# GBI
+fit_gb <- fit_gbi(X1_gamma, eps=1e-6, verbose=TRUE)
+d_gb <- predict_den_gbi(fit_gb, xs)
+par(mfrow=c(1,2))
+hist(X1_gamma, breaks=30, freq=FALSE, main="EB (τ=1)", xlab="x", col="grey90", border="white")
+lines(xs, d_eb/max(d_eb)*max(hist(X1_gamma, breaks=30, plot=FALSE)$density), lwd=2)
+hist(X1_gamma, breaks=30, freq=FALSE, main="GBI (τ optimized)", xlab="x", col="grey90", border="white")
+lines(xs, d_gb/max(d_gb)*max(hist(X1_gamma, breaks=30, plot=FALSE)$density), lwd=2)
+par(mfrow=c(1,1))
+```
+
+## 1D Triple Gaussian
+
+```{r}
+set.seed(111)
+X1_tri <- matrix(c(rnorm(150, -2, 0.6), rnorm(100, 0, 1.0), rnorm(150, 3, 0.8)), ncol = 1)
+# EB
+fit_eb <- ebf_fit(X1_tri, eps=1e-6, verbose=TRUE)
+xs <- seq(min(X1_tri)-3, max(X1_tri)+3, length.out=500)
+d_eb <- predict_den_eb(fit_eb, xs)
+# GBI
+fit_gb <- fit_gbi(X1_tri, eps=1e-6, verbose=TRUE)
+d_gb <- predict_den_gbi(fit_gb, xs)
+par(mfrow=c(1,2))
+hist(X1_tri, breaks=30, freq=FALSE, main="EB (τ=1)", xlab="x", col="grey90", border="white")
+lines(xs, d_eb/max(d_eb)*max(hist(X1_tri, breaks=30, plot=FALSE)$density), lwd=2)
+hist(X1_tri, breaks=30, freq=FALSE, main="GBI (τ optimized)", xlab="x", col="grey90", border="white")
+lines(xs, d_gb/max(d_gb)*max(hist(X1_tri, breaks=30, plot=FALSE)$density), lwd=2)
+par(mfrow=c(1,1))
+```
+
+## 1D Student-t(ν=3)
+
+```{r}
+set.seed(112)
+X1_t <- matrix(rt(300, df = 3), ncol = 1)
+# EB
+fit_eb <- ebf_fit(X1_t, eps=1e-6, verbose=TRUE)
+xs <- seq(min(X1_t)-3, max(X1_t)+3, length.out=500)
+d_eb <- predict_den_eb(fit_eb, xs)
+# GBI
+fit_gb <- fit_gbi(X1_t, eps=1e-6, verbose=TRUE)
+d_gb <- predict_den_gbi(fit_gb, xs)
+par(mfrow=c(1,2))
+hist(X1_t, breaks=30, freq=FALSE, main="EB (τ=1)", xlab="x", col="grey90", border="white")
+lines(xs, d_eb/max(d_eb)*max(hist(X1_t, breaks=30, plot=FALSE)$density), lwd=2)
+hist(X1_t, breaks=30, freq=FALSE, main="GBI (τ optimized)", xlab="x", col="grey90", border="white")
+lines(xs, d_gb/max(d_gb)*max(hist(X1_t, breaks=30, plot=FALSE)$density), lwd=2)
+par(mfrow=c(1,1))
+```
+
+# 2D 데이터 (5개) — EB vs GBI
+
+> 각 데이터마다 EB → GBI 순서로 결과를 별도 코드 청크로 제시합니다. 2D는 격자에서 f(x) 예측 후 exp(f)로 표시합니다.
+
+```{r}
+# 간단한 2D 시각화 도우미 (공통 함수 아님, plotting 편의를 위한 최소 유틸)
+plot_density_2d <- function(X, fit, pred_fun, main_title, grid_n=120){
+  rng <- apply(X, 2, range)
+  gx <- seq(rng[1,1]-1, rng[2,1]+1, length.out=grid_n)
+  gy <- seq(rng[1,2]-1, rng[2,2]+1, length.out=grid_n)
+  G <- expand.grid(gx, gy); colnames(G) <- c("x","y")
+  den <- pred_fun(fit, as.matrix(G)); den <- matrix(den, grid_n, grid_n)
+  image(gx, gy, den, main=main_title, xlab="x1", ylab="x2")
+  points(X, pch=16, cex=0.4)
+  contour(gx, gy, den, add=TRUE, drawlabels=FALSE)
+}
+```
+
+## 2D Banana Shape
+
+```{r}
+set.seed(201)
+n_banana <- 400
+x_b <- rnorm(n_banana, 0, 1.5)
+y_b <- x_b^2 + rnorm(n_banana, 0, 0.8)
+X2_banana <- cbind(x_b, y_b)
+# EB
+fit_eb <- ebf_fit(X2_banana, eps=1e-6, verbose=TRUE)
+par(mfrow=c(1,2))
+plot_density_2d(X2_banana, fit_eb, predict_den_eb, "EB (τ=1)")
+# GBI
+fit_gb <- fit_gbi(X2_banana, eps=1e-6, verbose=TRUE)
+plot_density_2d(X2_banana, fit_gb, predict_den_gbi, "GBI (τ optimized)")
+par(mfrow=c(1,1))
+```
+
+## 2D Ring Shape
+
+```{r}
+set.seed(202)
+n_ring <- 300
+radius <- rnorm(n_ring, mean = 3, sd = 0.3)
+angle <- runif(n_ring, 0, 2*pi)
+x_r <- radius * cos(angle)
+y_r <- radius * sin(angle)
+X2_ring <- cbind(x_r, y_r)
+# EB
+fit_eb <- ebf_fit(X2_ring, eps=1e-6, verbose=TRUE)
+par(mfrow=c(1,2))
+plot_density_2d(X2_ring, fit_eb, predict_den_eb, "EB (τ=1)")
+# GBI
+fit_gb <- fit_gbi(X2_ring, eps=1e-6, verbose=TRUE)
+plot_density_2d(X2_ring, fit_gb, predict_den_gbi, "GBI (τ optimized)")
+par(mfrow=c(1,1))
+```
+
+## 2D Three Clusters
+
+```{r}
+# mvn 샘플은 MASS::mvrnorm 사용
+if (!requireNamespace("MASS", quietly = TRUE)) stop("Package 'MASS' required for mvrnorm.")
+set.seed(203)
+X2_cluster <- rbind(
+  MASS::mvrnorm(100, mu = c(-1.5, 1.5), Sigma = diag(2) * 0.4),
+  MASS::mvrnorm(100, mu = c(1.5, 1.5),  Sigma = diag(2) * 0.4),
+  MASS::mvrnorm(180, mu = c(0, -1.5),  Sigma = diag(2) * 0.4)
+)
+# EB
+fit_eb <- ebf_fit(X2_cluster, eps=1e-6, verbose=TRUE)
+par(mfrow=c(1,2))
+plot_density_2d(X2_cluster, fit_eb, predict_den_eb, "EB (τ=1)")
+# GBI
+fit_gb <- fit_gbi(X2_cluster, eps=1e-6, verbose=TRUE)
+plot_density_2d(X2_cluster, fit_gb, predict_den_gbi, "GBI (τ optimized)")
+par(mfrow=c(1,1))
+```
+
+## 2D Two Moons (flipped)
+
+```{r}
+set.seed(211)
+n_moon <- 500
+theta  <- runif(n_moon, 0, pi)
+moon1 <- cbind(cos(theta),  sin(theta)) + matrix(rnorm(2*n_moon, 0, 0.1), ncol = 2)
+moon2 <- cbind(1 - cos(theta), -sin(theta) + 0.5) + matrix(rnorm(2*n_moon, 0, 0.1), ncol = 2)
+X2_moons <- rbind(moon1, moon2)
+# EB
+fit_eb <- ebf_fit(X2_moons, eps=1e-6, verbose=TRUE)
+par(mfrow=c(1,2))
+plot_density_2d(X2_moons, fit_eb, predict_den_eb, "EB (τ=1)")
+# GBI
+fit_gb <- fit_gbi(X2_moons, eps=1e-6, verbose=TRUE)
+plot_density_2d(X2_moons, fit_gb, predict_den_gbi, "GBI (τ optimized)")
+par(mfrow=c(1,1))
+```
+
+## 2D Plus Shape
+
+```{r}
+set.seed(212)
+n_plus <- 500
+x_axis <- cbind(rnorm(n_plus, 0, 1.2), rnorm(n_plus, 0, 0.2))
+y_axis <- cbind(rnorm(n_plus, 0, 0.2), rnorm(n_plus, 0, 1.2))
+X2_plus <- rbind(x_axis, y_axis)
+# EB
+fit_eb <- ebf_fit(X2_plus, eps=1e-6, verbose=TRUE)
+par(mfrow=c(1,2))
+plot_density_2d(X2_plus, fit_eb, predict_den_eb, "EB (τ=1)")
+# GBI
+fit_gb <- fit_gbi(X2_plus, eps=1e-6, verbose=TRUE)
+plot_density_2d(X2_plus, fit_gb, predict_den_gbi, "GBI (τ optimized)")
+par(mfrow=c(1,1))
+```
+
+# 메모
+- EB/VEM 섹션의 `eps`는 **고정 jitter**(안정화용)이며, 최적화하지 않습니다.
+- GBI 섹션의 `tau`는 **온도**로, loss 스케일에 대한 캘리브레이션을 담당합니다.
+- 두 방법 모두 σ, λ는 최적화 대상입니다(GBI는 τ도 포함).
+
