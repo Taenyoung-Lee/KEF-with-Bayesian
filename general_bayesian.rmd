@@ -1,0 +1,429 @@
+---
+title: "Generalized Bayesian Inference (GBI) for Score-Matching KEF"
+author: "Taenyoung Lee"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    df_print: paged
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4.5
+)
+```
+
+# 개요
+
+이 문서는 **문서 1번 접근(Generalized Bayesian Method)**을 KEF + Score Matching 설정에 맞춰 **온도(temperature) \(\tau\)** 를 포함한 형태로 구현합니다. 핵심 아이디어는 likelihood 대신 **score matching loss \(J(\alpha)\)**를 사용하여
+
+\[ p(\alpha\mid D) \propto \exp\{-\tau\,J(\alpha)\}\, p(\alpha) \]
+
+로 posterior를 정의하는 것입니다. 본 구현에서는 수치적 안정화를 위해 **`epsilon`** (고정 jitter)를 사용합니다.
+
+> 본 파일은 **Empirical Bayes/EM** 스타일로 \((\sigma, \lambda, \tau)\)를 튜닝할 수 있게 ELBO(혹은 free energy) 목적을 구성하고, 그레이디언트 기반 갱신을 제공합니다.
+
+# 수식 정리
+
+- Score matching 이차형(KEF 전개): \( J(\alpha) = \tfrac{1}{2}\alpha^\top H\alpha + \tfrac{1}{T} b^\top \alpha \).  
+  (여기서는 \(\lambda\)를 **prior 정밀도**에 포함시키기 위해 loss 내부의 \(\lambda\)-항은 제외합니다.)
+- 가우시안 prior: \( p(\alpha)=\mathcal{N}(0, Q^{-1}) \) with \(Q = \lambda K + \epsilon I\).
+- 온도 \(\tau>0\)를 곱한 generalized posterior는 가우시안이며,
+  - **정밀도**: \( R := \tau H + Q = \tau H + \lambda K + \epsilon I \)
+  - **평균**: \( m := - R^{-1} \,(\tau/T)\, b \)
+  - **공분산**: \( S := R^{-1} \)
+
+**목적함수(증거/정규화상수 기준 free energy)**: 상수항을 제외하고 다음을 **최대화**합니다.
+
+\[ \mathcal{L}(\sigma,\lambda,\tau) = \tfrac{1}{2}\log|Q| - \tfrac{1}{2}\log|R| + \tfrac{1}{2}\Big(\tfrac{\tau}{T}\Big)^2 b^\top R^{-1} b. \]
+
+> 위 식은 \(\int e^{-\tau J(\alpha)} p(\alpha) d\alpha\)를 가우시안 적분으로 닫아 **상수항을 제거한 형태**입니다. `epsilon`은 **온도와 무관한 수치적 jitter**입니다.
+
+# 구현
+
+## 유틸리티
+
+```{r}
+safe_chol <- function(M) {
+  base <- mean(diag(M))
+  eps  <- if (is.finite(base) && base > 0) 1e-10 * base else 1e-10
+  for (k in 0:8) {
+    out <- try(chol(M + diag(eps, nrow(M))), silent = TRUE)
+    if (!inherits(out, "try-error")) return(out)
+    eps <- eps * 10
+  }
+  stop("Cholesky failed. Matrix might be ill-conditioned.")
+}
+
+chol_solve <- function(L, B) {
+  y <- forwardsolve(t(L), B, upper.tri = FALSE, transpose = FALSE)
+  x <- backsolve(L, y, transpose = FALSE)
+  x
+}
+
+logdet_from_chol <- function(L) 2 * sum(log(diag(L)))
+```
+
+## RBF 커널 및 도함수
+
+```{r}
+rbf_kernel <- function(X, sigma) {
+  D2 <- as.matrix(dist(X, method = "euclidean"))^2
+  exp(- D2 / (2 * sigma^2))
+}
+
+grad_k_at <- function(x_t, X, sigma) {
+  diff <- matrix(x_t, nrow = nrow(X), ncol = ncol(X), byrow = TRUE) - X
+  r2   <- rowSums(diff^2)
+  kvec <- exp(- r2 / (2 * sigma^2))
+  Gcols <- - (diff / sigma^2) * kvec
+  t(Gcols)
+}
+
+laplacian_k_at <- function(x_t, X, sigma) {
+  d <- ncol(X)
+  diff <- matrix(x_t, nrow = nrow(X), ncol = ncol(X), byrow = TRUE) - X
+  r2 <- rowSums(diff^2)
+  kvec <- exp(- r2 / (2 * sigma^2))
+  (-d / sigma^2 + r2 / sigma^4) * kvec
+}
+
+# sigma-derivatives
+dK_dsigma <- function(X, sigma, K_precomp = NULL) {
+  if (is.null(K_precomp)) K_precomp <- rbf_kernel(X, sigma)
+  D2 <- as.matrix(dist(X, method = "euclidean"))^2
+  K_precomp * (D2 / sigma^3)
+}
+
+dgrad_k_dsigma_at <- function(x_t, X, sigma) {
+  diff <- matrix(x_t, nrow = nrow(X), ncol = ncol(X), byrow = TRUE) - X
+  r2   <- rowSums(diff^2)
+  kvec <- exp(- r2 / (2 * sigma^2))
+  factor <- (2 / sigma^3) - (r2 / sigma^5)
+  Gsig_cols <- diff * (kvec * factor)
+  t(Gsig_cols)
+}
+
+dlap_k_dsigma_at <- function(x_t, X, sigma) {
+  d <- ncol(X)
+  diff <- matrix(x_t, nrow = nrow(X), ncol = ncol(X), byrow = TRUE) - X
+  r2 <- rowSums(diff^2)
+  kvec <- exp(- r2 / (2 * sigma^2))
+  kvec * ( (2*d)/sigma^3 - ((d+4)*r2)/sigma^5 + (r2^2)/sigma^7 )
+}
+```
+
+## H, b, K 및 sigma 도함수
+
+```{r}
+build_mats <- function(X, sigma) {
+  Tn <- nrow(X)
+  K <- rbf_kernel(X, sigma)
+  H <- matrix(0, Tn, Tn)
+  b <- numeric(Tn)
+  for (t in 1:Tn) {
+    Gt <- grad_k_at(X[t, , drop = FALSE], X, sigma)
+    H  <- H + crossprod(Gt)
+    b  <- b + laplacian_k_at(X[t, , drop = FALSE], X, sigma)
+  }
+  H <- H / Tn
+  list(K = K, H = H, b = b)
+}
+
+build_sigma_derivs <- function(X, sigma, K = NULL) {
+  Tn <- nrow(X)
+  if (is.null(K)) K <- rbf_kernel(X, sigma)
+  dK <- dK_dsigma(X, sigma, K)
+  dH <- matrix(0, Tn, Tn)
+  db <- numeric(Tn)
+  for (t in 1:Tn) {
+    dGt <- dgrad_k_dsigma_at(X[t, , drop = FALSE], X, sigma)
+    dH  <- dH + crossprod(dGt)
+    db  <- db + dlap_k_dsigma_at(X[t, , drop = FALSE], X, sigma)
+  }
+  dH <- dH / Tn
+  list(dK = dK, dH = dH, db = db)
+}
+```
+
+## GBI-ELBO(Free Energy)와 기울기
+
+\(Q = \lambda K + \epsilon I\), \(R = \tau H + Q\).
+
+```{r}
+elbo_gbi_value <- function(K, H, b, lambda, tau, epsilon) {
+  Tn <- length(b)
+  Q <- lambda * K + diag(epsilon, Tn)
+  R <- tau * H + Q
+  LQ <- safe_chol(Q)
+  LR <- safe_chol(R)
+  prior_term <- 0.5 * logdet_from_chol(LQ)
+  post_term  <- -0.5 * logdet_from_chol(LR)
+  Rinv_b <- chol_solve(LR, b)
+  fit_term  <- 0.5 * (tau^2 / Tn^2) * as.numeric(crossprod(b, Rinv_b))
+  prior_term + post_term + fit_term
+}
+
+# dL/dlambda: Q -> Q + dQ, R -> R + dQ, with dQ = K
+grad_lambda_gbi <- function(K, H, b, lambda, tau, epsilon) {
+  Tn <- length(b)
+  Q <- lambda * K + diag(epsilon, Tn)
+  R <- tau * H + Q
+  LQ <- safe_chol(Q)
+  LR <- safe_chol(R)
+
+  XQ <- chol_solve(LQ, K)  # Q^{-1} K
+  tr1 <- sum(diag(XQ))
+  XR <- chol_solve(LR, K)  # R^{-1} K
+  tr2 <- sum(diag(XR))
+
+  Rinv_b <- chol_solve(LR, b)
+  quad <- as.numeric(crossprod(Rinv_b, K %*% Rinv_b))
+
+  0.5 * tr1 - 0.5 * tr2 - 0.5 * (tau^2 / Tn^2) * quad
+}
+
+# dL/dtau: R -> R + (d tau) H, and fit term has tau^2 factor
+grad_tau_gbi <- function(K, H, b, lambda, tau, epsilon) {
+  Tn <- length(b)
+  Q <- lambda * K + diag(epsilon, Tn)
+  R <- tau * H + Q
+  LR <- safe_chol(R)
+
+  XR <- chol_solve(LR, H)  # R^{-1} H
+  tr_Rinv_H <- sum(diag(XR))
+
+  Rinv_b <- chol_solve(LR, b)
+  bRinvb <- as.numeric(crossprod(b, Rinv_b))
+  quad_H  <- as.numeric(crossprod(Rinv_b, H %*% Rinv_b))
+
+  # d/dtau [ -0.5 log|R| + 0.5 (tau^2/T^2) b^T R^{-1} b ]
+  -0.5 * tr_Rinv_H + (tau / Tn^2) * bRinvb - 0.5 * (tau^2 / Tn^2) * quad_H
+}
+
+# dL/dsigma via dK, dH, db and dR = tau dH + dQ (with dQ = lambda dK)
+grad_sigma_gbi <- function(K, H, b, lambda, tau, epsilon, dK, dH, db) {
+  Tn <- length(b)
+  Q <- lambda * K + diag(epsilon, Tn)
+  R <- tau * H + Q
+  LQ <- safe_chol(Q)
+  LR <- safe_chol(R)
+
+  dQ <- lambda * dK
+  dR <- tau * dH + dQ
+
+  XQ <- chol_solve(LQ, dQ)            # Q^{-1} dQ
+  tr_Qinv_dQ <- sum(diag(XQ))
+  XR <- chol_solve(LR, dR)            # R^{-1} dR
+  tr_Rinv_dR <- sum(diag(XR))
+
+  Rinv_b <- chol_solve(LR, b)
+  term1  <- sum(db * Rinv_b)
+  tmp    <- chol_solve(LR, dR %*% Rinv_b)
+  term2  <- as.numeric(crossprod(b, tmp))
+
+  0.5 * tr_Qinv_dQ - 0.5 * tr_Rinv_dR + (tau^2 / (2 * Tn^2)) * (2 * term1 - term2)
+}
+```
+
+## 사후 평균 및 예측
+
+```{r}
+solve_posterior_gbi <- function(H, K, b, lambda, tau, epsilon, Tn) {
+  Q <- lambda * K + diag(epsilon, Tn)
+  R <- tau * H + Q
+  LR <- safe_chol(R)
+  Rinv_b <- chol_solve(LR, b)
+  m <- - (tau / Tn) * Rinv_b
+  list(m = m, cholR = LR)
+}
+
+predict_f <- function(fit, Xnew) {
+  Xnew <- as.matrix(Xnew)
+  if (isTRUE(fit$standardize)) {
+    Xnew <- sweep(Xnew, 2, fit$x_center, "-")
+    Xnew <- sweep(Xnew, 2, fit$x_scale,  "/")
+  }
+  Tn <- nrow(fit$X)
+  out <- matrix(0, nrow(Xnew), Tn)
+  for (i in 1:nrow(Xnew)) {
+    diff <- sweep(fit$X, 2, Xnew[i, ], FUN = "-")
+    r2 <- rowSums(diff^2)
+    out[i, ] <- exp(- r2 / (2 * fit$sigma^2))
+  }
+  as.numeric(out %*% fit$m)
+}
+
+predict_unnorm_density <- function(fit, Xnew) exp(predict_f(fit, Xnew))
+```
+
+## VEM/EM 스타일 최적화
+
+- 튜닝 대상: \(\sigma, \lambda, \tau\).  
+- 로그-공간 갱신 + 백트래킹 라인서치로 \(\mathcal{L}\) 증가.
+- `epsilon`은 고정 jitter.
+
+```{r}
+fit_gbi <- function(X,
+                    sigma_init = NULL,
+                    lambda_init = 1.0,
+                    tau_init = 1.0,
+                    epsilon = 1e-6,
+                    max_iter = 200,
+                    tol = 1e-4,
+                    step_sigma = 0.2,
+                    step_lambda = 0.2,
+                    step_tau = 0.2,
+                    verbose = TRUE,
+                    standardize = TRUE,
+                    sigma_clip_factor = c(0.2, 5.0),
+                    lambda_bounds = c(1e-8, 1e6),
+                    tau_bounds = c(1e-3, 1e3)) {
+  X <- as.matrix(X)
+  Tn <- nrow(X); d <- ncol(X)
+
+  # standardize
+  x_center <- rep(0, d); x_scale <- rep(1, d)
+  if (standardize) {
+    x_center <- colMeans(X)
+    x_scale  <- apply(X, 2, sd)
+    x_scale[x_scale == 0 | !is.finite(x_scale)] <- 1
+    X <- scale(X, center = x_center, scale = x_scale)
+  }
+
+  # sigma bounds
+  D <- as.matrix(dist(X))
+  med_d <- median(D[D > 0]); if (!is.finite(med_d) || med_d <= 0) med_d <- 1
+  smin <- sigma_clip_factor[1] * med_d
+  smax <- sigma_clip_factor[2] * med_d
+
+  sigma <- if (is.null(sigma_init)) med_d else sigma_init
+  sigma <- min(max(sigma, smin), smax)
+  lnsigma <- log(sigma)
+
+  lambda <- min(max(lambda_init, lambda_bounds[1]), lambda_bounds[2])
+  lnlambda <- log(lambda)
+
+  tau <- min(max(tau_init, tau_bounds[1]), tau_bounds[2])
+  lntau <- log(tau)
+
+  mats <- build_mats(X, sigma)
+  Lcur <- elbo_gbi_value(mats$K, mats$H, mats$b, lambda, tau, epsilon)
+  if (verbose) cat(sprintf("[init] sigma=%.4g, lambda=%.4g, tau=%.4g, ELBO=%.6f\n",
+                           sigma, lambda, tau, Lcur))
+
+  for (it in 1:max_iter) {
+    improved_any <- FALSE
+
+    # lambda update
+    gl <- grad_lambda_gbi(mats$K, mats$H, mats$b, lambda, tau, epsilon)
+    g_theta <- lambda * gl
+    if (!is.finite(g_theta)) g_theta <- 0
+    step <- step_lambda
+    for (ls in 1:20) {
+      lambda_try <- exp(lnlambda + step * g_theta)
+      lambda_try <- min(max(lambda_try, lambda_bounds[1]), lambda_bounds[2])
+      Ltry <- elbo_gbi_value(mats$K, mats$H, mats$b, lambda_try, tau, epsilon)
+      if (is.finite(Ltry) && Ltry >= Lcur - 1e-12) {
+        lambda <- lambda_try; lnlambda <- log(lambda); Lcur <- Ltry
+        improved_any <- TRUE; break
+      } else step <- step / 2
+    }
+
+    # tau update
+    gt <- grad_tau_gbi(mats$K, mats$H, mats$b, lambda, tau, epsilon)
+    g_theta <- tau * gt
+    if (!is.finite(g_theta)) g_theta <- 0
+    step <- step_tau
+    for (ls in 1:20) {
+      tau_try <- exp(lntau + step * g_theta)
+      tau_try <- min(max(tau_try, tau_bounds[1]), tau_bounds[2])
+      Ltry <- elbo_gbi_value(mats$K, mats$H, mats$b, lambda, tau_try, epsilon)
+      if (is.finite(Ltry) && Ltry >= Lcur - 1e-12) {
+        tau <- tau_try; lntau <- log(tau); Lcur <- Ltry
+        improved_any <- TRUE; break
+      } else step <- step / 2
+    }
+
+    # sigma update
+    ders <- build_sigma_derivs(X, sigma, K = mats$K)
+    gs <- grad_sigma_gbi(mats$K, mats$H, mats$b, lambda, tau, epsilon,
+                         ders$dK, ders$dH, ders$db)
+    g_theta <- sigma * gs
+    if (!is.finite(g_theta)) g_theta <- 0
+    step <- step_sigma
+    for (ls in 1:20) {
+      sigma_try <- exp(lnsigma + step * g_theta)
+      sigma_try <- min(max(sigma_try, smin), smax)
+      mats_try <- build_mats(X, sigma_try)
+      Ltry <- elbo_gbi_value(mats_try$K, mats_try$H, mats_try$b, lambda, tau, epsilon)
+      if (is.finite(Ltry) && Ltry >= Lcur - 1e-12) {
+        sigma <- sigma_try; lnsigma <- log(sigma)
+        mats <- mats_try;   Lcur <- Ltry
+        improved_any <- TRUE; break
+      } else step <- step / 2
+    }
+
+    if (verbose) cat(sprintf("[iter %03d] sigma=%.6g, lambda=%.6g, tau=%.6g, ELBO=%.6f\n",
+                             it, sigma, lambda, tau, Lcur))
+
+    if (!improved_any || (step_sigma * abs(g_theta) < tol)) break
+  }
+
+  post <- solve_posterior_gbi(mats$H, mats$K, mats$b, lambda, tau, epsilon, Tn)
+
+  list(
+    sigma = sigma, lambda = lambda, tau = tau, epsilon = epsilon, elbo = Lcur,
+    m = post$m, H = mats$H, K = mats$K, b = mats$b,
+    R_chol = post$cholR, X = X,
+    standardize = standardize, x_center = x_center, x_scale = x_scale
+  )
+}
+```
+
+## 데모 (1D)
+
+```{r}
+set.seed(42)
+n <- 200
+X <- c(rnorm(n/2, -3, 0.6), rnorm(n/2, 3, 0.9))
+X <- matrix(X, ncol = 1)
+
+fit <- fit_gbi(X,
+               sigma_init = NULL,
+               lambda_init = 1.0,
+               tau_init = 1.0,
+               epsilon = 1e-6,
+               max_iter = 200,
+               tol = 1e-5,
+               verbose = TRUE,
+               standardize = TRUE)
+
+cat("\n--- Fitted (GBI) hyperparameters ---\n")
+print(list(sigma = fit$sigma, lambda = fit$lambda, tau = fit$tau, ELBO = fit$elbo))
+
+xs <- seq(min(X) - 3, max(X) + 3, length.out = 400)
+dens_u <- predict_unnorm_density(fit, xs)
+
+op <- par(no.readonly = TRUE); on.exit(par(op))
+hist(X, breaks = 30, freq = FALSE,
+     main = "GBI (τ) + Score Matching (unnormalized)",
+     xlab = "x", ylab = "density (unnorm)",
+     col = "grey90", border = "white")
+lines(xs,
+      dens_u / max(dens_u) * max(hist(X, breaks = 30, plot = FALSE)$density),
+      lwd = 2)
+```
+
+# 사용 팁
+
+- `epsilon`은 **항상 고정된 작은 jitter**로 두세요 (예: `1e-6 ~ 1e-4`).
+- `tau`는 **후분산의 스케일을 조절**합니다(커질수록 공분산이 작아짐). 평균 \(m\)은 \(R^{-1}(\tau/T)b\)에 의해 간접적으로 변합니다.
+- 문서 2번 구현과 **직접 비교**하려면: `tau=1`, 그리고 2번 구현의 `epsilon`과 동일 jitter를 사용해보세요 (다만 2번은 posterior가 EB 관점에서 유도됨).
+

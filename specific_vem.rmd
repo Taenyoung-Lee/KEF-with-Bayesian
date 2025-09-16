@@ -1,0 +1,351 @@
+---
+title: "Kernel Exponential Families + Score Matching with Variational EM"
+author: "Taenyoung Lee"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    df_print: paged
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4.5
+)
+```
+
+# 개요
+
+이 문서는 **문서의 2번 접근(KEF + Score Matching)**을 구현하고, **Empirical Bayes(Variational EM)**로 하이퍼파라미터 \((\sigma, \lambda)\)를 추정하는 R Markdown 스크립트입니다.
+
+> 혼동을 피하기 위해, 본 문서에서는 수치적 안정화 항을 **`epsilon`** 으로 표기합니다.  
+> - `epsilon`은 **일반화 베이지안(문서 1번)의 온도 파라미터가 아니라**, \(H+\lambda K\)에 작은 jitter를 더해 **행렬 분해 안정성**을 확보하기 위한 항입니다.
+> - 따라서 Variational EM에서 업데이트하지 않고, 고정된 작은 값으로 둡니다.
+
+# 수식 요약 (문서 2번과의 매핑)
+
+- 커널 지수족에서 \( f(x) = \sum_{i=1}^T \alpha_i k(x, x_i) \), RBF 커널 \(k\) 사용.
+- Score Matching으로 유도되는 이차형 목적 \( \bar J(\alpha) = \tfrac{1}{2}\alpha^\top H\alpha + \tfrac{\lambda}{2}\alpha^\top K\alpha + \tfrac{1}{T} b^\top \alpha \).
+- 정규방정식: \((H + \lambda K)\alpha + \tfrac{1}{T}b = 0\).
+- 닫힌형 해: \(\alpha^* = - (H + \lambda K)^{-1} \tfrac{1}{T} b\).
+- 본 구현에서는 수치 안정화를 위해 \(A := H + \lambda K + \epsilon I\)를 사용하고, 
+  \[\alpha^* = -\frac{1}{T} A^{-1} b.\]
+- Empirical Bayes(Variational EM)로 \(\sigma, \lambda\)를 **ELBO 최대화**로 갱신합니다.
+
+# 구현
+
+## 유틸리티 함수
+
+```{r}
+safe_chol <- function(M) {
+  base <- mean(diag(M))
+  eps  <- if (is.finite(base) && base > 0) 1e-10 * base else 1e-10
+  for (k in 0:8) {
+    out <- try(chol(M + diag(eps, nrow(M))), silent = TRUE)
+    if (!inherits(out, "try-error")) return(out)
+    eps <- eps * 10
+  }
+  stop("Cholesky failed. Matrix might be ill-conditioned.")
+}
+
+chol_solve <- function(L, B) {
+  y <- forwardsolve(t(L), B, upper.tri = FALSE, transpose = FALSE)
+  x <- backsolve(L, y, transpose = FALSE)
+  x
+}
+
+logdet_from_chol <- function(L) 2 * sum(log(diag(L)))
+```
+
+## RBF 커널과 도함수
+
+
+```{r}
+rbf_kernel <- function(X, sigma) {
+  D2 <- as.matrix(dist(X, method = "euclidean"))^2
+  exp(- D2 / (2 * sigma^2))
+}
+
+# ∇_x k at x = x_t (columns = all i)
+grad_k_at <- function(x_t, X, sigma) {
+  diff <- matrix(x_t, nrow = nrow(X), ncol = ncol(X), byrow = TRUE) - X  # (T x d)
+  r2   <- rowSums(diff^2)
+  kvec <- exp(- r2 / (2 * sigma^2))
+  Gcols <- - (diff / sigma^2) * kvec    # (T x d)
+  t(Gcols)                               # d x T
+}
+
+# Δ_x k at x = x_t (vector over i)
+laplacian_k_at <- function(x_t, X, sigma) {
+  d <- ncol(X)
+  diff <- matrix(x_t, nrow = nrow(X), ncol = ncol(X), byrow = TRUE) - X
+  r2 <- rowSums(diff^2)
+  kvec <- exp(- r2 / (2 * sigma^2))
+  (-d / sigma^2 + r2 / sigma^4) * kvec
+}
+
+# σ-derivatives
+dK_dsigma <- function(X, sigma, K_precomp = NULL) {
+  if (is.null(K_precomp)) K_precomp <- rbf_kernel(X, sigma)
+  D2 <- as.matrix(dist(X, method = "euclidean"))^2
+  K_precomp * (D2 / sigma^3)
+}
+
+dgrad_k_dsigma_at <- function(x_t, X, sigma) {
+  diff <- matrix(x_t, nrow = nrow(X), ncol = ncol(X), byrow = TRUE) - X
+  r2   <- rowSums(diff^2)
+  kvec <- exp(- r2 / (2 * sigma^2))
+  factor <- (2 / sigma^3) - (r2 / sigma^5)
+  Gsig_cols <- diff * (kvec * factor)   # (T x d)
+  t(Gsig_cols)                           # d x T
+}
+
+dlap_k_dsigma_at <- function(x_t, X, sigma) {
+  d <- ncol(X)
+  diff <- matrix(x_t, nrow = nrow(X), ncol = ncol(X), byrow = TRUE) - X
+  r2   <- rowSums(diff^2)
+  kvec <- exp(- r2 / (2 * sigma^2))
+  kvec * ( (2*d)/sigma^3 - ((d+4)*r2)/sigma^5 + (r2^2)/sigma^7 )
+}
+```
+
+## H, b, K 구성
+
+
+```{r}
+build_mats <- function(X, sigma) {
+  Tn <- nrow(X)
+  K <- rbf_kernel(X, sigma)
+  H <- matrix(0, Tn, Tn)
+  b <- numeric(Tn)
+  for (t in 1:Tn) {
+    Gt <- grad_k_at(X[t, , drop = FALSE], X, sigma)     # d x T
+    H  <- H + crossprod(Gt)                             # T x T
+    b  <- b + laplacian_k_at(X[t, , drop = FALSE], X, sigma)
+  }
+  H <- H / Tn
+  list(K = K, H = H, b = b)
+}
+
+build_sigma_derivs <- function(X, sigma, K = NULL) {
+  Tn <- nrow(X)
+  if (is.null(K)) K <- rbf_kernel(X, sigma)
+  dK <- dK_dsigma(X, sigma, K)
+  dH <- matrix(0, Tn, Tn)
+  db <- numeric(Tn)
+  for (t in 1:Tn) {
+    dGt <- dgrad_k_dsigma_at(X[t, , drop = FALSE], X, sigma)  # d x T
+    dH  <- dH + crossprod(dGt)                                # T x T
+    db  <- db + dlap_k_dsigma_at(X[t, , drop = FALSE], X, sigma)
+  }
+  dH <- dH / Tn
+  list(dK = dK, dH = dH, db = db)
+}
+```
+
+
+## ELBO (prior precision \(Q = \lambda K + \epsilon I\))
+
+```{r}
+elbo_value <- function(K, H, b, lambda, epsilon) {
+  Tn <- length(b)
+  Q <- lambda * K + diag(epsilon, Tn)
+  A <- H + Q
+  LQ <- safe_chol(Q)
+  LA <- safe_chol(A)
+  prior_term <- 0.5 * logdet_from_chol(LQ)
+  model_term <- -0.5 * logdet_from_chol(LA)
+  Ainv_b <- chol_solve(LA, b)
+  fit_term <- 0.5 * as.numeric(crossprod(b, Ainv_b)) / (Tn^2)
+  prior_term + model_term + fit_term
+}
+```
+
+## 사후 평균(폐형식 해)
+
+```{r}
+solve_alpha_closed <- function(H, K, b, lambda, epsilon, Tn) {
+  A <- H + lambda * K + diag(epsilon, Tn)
+  LA <- safe_chol(A)
+  Ainv_b <- chol_solve(LA, b)
+  alpha <- - (1 / Tn) * Ainv_b
+  list(alpha = alpha, A = A, cholA = LA)
+}
+```
+
+## Variational EM (Empirical Bayes)
+
+- 로그-공간 갱신 + 백트래킹 라인서치로 ELBO를 증가시키며 \(\sigma, \lambda\)를 업데이트합니다.
+- `epsilon`은 고정된 작은 값으로 두고 업데이트하지 않습니다.
+
+```{r}
+veem_fit <- function(X,
+                     sigma_init = NULL,
+                     lambda_init = 1.0,
+                     epsilon = 1e-6,
+                     max_iter = 200,
+                     tol = 1e-4,
+                     step_sigma = 0.3,
+                     step_lambda = 0.3,
+                     verbose = TRUE,
+                     standardize = TRUE,
+                     sigma_clip_factor = c(0.2, 5.0),
+                     lambda_bounds = c(1e-8, 1e6)) {
+
+  X <- as.matrix(X)
+  Tn <- nrow(X); d <- ncol(X)
+
+  if (standardize) {
+    x_center <- colMeans(X)
+    x_scale  <- apply(X, 2, sd)
+    x_scale[x_scale == 0 | !is.finite(x_scale)] <- 1
+    X <- scale(X, center = x_center, scale = x_scale)
+  } else {
+    x_center <- rep(0, d)
+    x_scale <- rep(1, d)
+  }
+
+  D <- as.matrix(dist(X))
+  med_d <- median(D[D > 0]); if (!is.finite(med_d) || med_d <= 0) med_d <- 1
+  smin <- sigma_clip_factor[1] * med_d
+  smax <- sigma_clip_factor[2] * med_d
+
+  sigma <- if (is.null(sigma_init)) med_d else sigma_init
+  sigma <- min(max(sigma, smin), smax)
+  lnsigma <- log(sigma)
+
+  lambda <- min(max(lambda_init, lambda_bounds[1]), lambda_bounds[2])
+  lnlambda <- log(lambda)
+
+  mats <- build_mats(X, sigma)
+  Lcur <- elbo_value(mats$K, mats$H, mats$b, lambda, epsilon)
+  if (verbose) cat(sprintf("[init] sigma=%.4g, lambda=%.4g, epsilon=%.4g, ELBO=%.6f\n",
+                           sigma, lambda, epsilon, Lcur))
+
+  for (it in 1:max_iter) {
+    improved_any <- FALSE
+
+    # --- Update lambda ---
+    gl <- grad_lambda_elbo(mats$K, mats$H, mats$b, lambda, epsilon)
+    g_theta <- lambda * gl
+    if (!is.finite(g_theta)) g_theta <- 0
+    step <- step_lambda
+    for (ls in 1:20) {
+      lambda_try <- exp(lnlambda + step * g_theta)
+      lambda_try <- min(max(lambda_try, lambda_bounds[1]), lambda_bounds[2])
+      Ltry <- elbo_value(mats$K, mats$H, mats$b, lambda_try, epsilon)
+      if (is.finite(Ltry) && Ltry >= Lcur - 1e-12) {
+        lambda <- lambda_try; lnlambda <- log(lambda); Lcur <- Ltry
+        improved_any <- TRUE; break
+      } else step <- step / 2
+    }
+
+    # --- Update sigma ---
+    ders <- build_sigma_derivs(X, sigma, K = mats$K)
+    gs <- grad_sigma_elbo(mats$K, mats$H, mats$b, lambda, epsilon,
+                          ders$dK, ders$dH, ders$db)
+    g_theta <- sigma * gs
+    if (!is.finite(g_theta)) g_theta <- 0
+    step <- step_sigma
+    for (ls in 1:20) {
+      sigma_try <- exp(lnsigma + step * g_theta)
+      sigma_try <- min(max(sigma_try, smin), smax)
+      mats_try <- build_mats(X, sigma_try)
+      Ltry <- elbo_value(mats_try$K, mats_try$H, mats_try$b, lambda, epsilon)
+      if (is.finite(Ltry) && Ltry >= Lcur - 1e-12) {
+        sigma <- sigma_try; lnsigma <- log(sigma)
+        mats <- mats_try;   Lcur <- Ltry
+        improved_any <- TRUE; break
+      } else step <- step / 2
+    }
+
+    if (verbose) cat(sprintf("[iter %03d] sigma=%.6g, lambda=%.6g, epsilon=%.6g, ELBO=%.6f\n",
+                             it, sigma, lambda, epsilon, Lcur))
+
+    if (!improved_any || (step_sigma * abs(g_theta) < tol)) break
+  }
+
+  sol <- solve_alpha_closed(mats$H, mats$K, mats$b, lambda, epsilon, Tn)
+
+  list(
+    sigma = sigma, lambda = lambda, epsilon = epsilon, elbo = Lcur,
+    alpha = sol$alpha, H = mats$H, K = mats$K, b = mats$b,
+    A_chol = sol$cholA, X = X,
+    standardize = standardize, x_center = x_center, x_scale = x_scale
+  )
+}
+```
+
+## 예측 함수 및 데모
+
+
+## 예측 함수
+
+```{r}
+# f(x) = sum_i alpha_i k(x, x_i)
+kef_predict_f <- function(fit, Xnew) {
+  Xnew <- as.matrix(Xnew)
+  if (isTRUE(fit$standardize)) {
+    Xnew <- sweep(Xnew, 2, fit$x_center, "-")
+    Xnew <- sweep(Xnew, 2, fit$x_scale,  "/")
+  }
+  Tn <- nrow(fit$X)
+  out <- matrix(0, nrow(Xnew), Tn)
+  for (i in 1:nrow(Xnew)) {
+    diff <- sweep(fit$X, 2, Xnew[i, ], FUN = "-")
+    r2 <- rowSums(diff^2)
+    out[i, ] <- exp(- r2 / (2 * fit$sigma^2))
+  }
+  as.numeric(out %*% fit$alpha)
+}
+
+kef_predict_unnormalized_density <- function(fit, Xnew) {
+  exp(kef_predict_f(fit, Xnew))
+}
+```
+
+# 데모 (1D 혼합 정규)
+
+```{r}
+set.seed(42)
+n <- 200
+X <- c(rnorm(n/2, -3, 0.6), rnorm(n/2, 3, 0.9))
+X <- matrix(X, ncol = 1)
+
+fit <- veem_fit(X,
+                sigma_init = NULL,
+                lambda_init = 1.0,
+                
+                max_iter = 200,
+                tol = 1e-5,
+                verbose = TRUE,
+                standardize = TRUE)
+
+cat("\n--- Fitted hyperparameters ---\n")
+print(list(sigma = fit$sigma, lambda = fit$lambda,
+           ELBO = fit$elbo))
+
+xs <- seq(min(X) - 3, max(X) + 3, length.out = 400)
+dens_u <- kef_predict_unnormalized_density(fit, xs)
+
+op <- par(no.readonly = TRUE); on.exit(par(op))
+hist(X, breaks = 30, freq = FALSE,
+     main = "KEF + Score Matching (unnormalized density)",
+     xlab = "x", ylab = "density (unnorm)",
+     col = "grey90", border = "white")
+lines(xs,
+      dens_u / max(dens_u) * max(hist(X, breaks = 30, plot = FALSE)$density),
+      lwd = 2)
+```
+
+# 요약
+
+- `epsilon`은 **안정화 jitter**로만 사용되며, 업데이트하지 않습니다.
+- VEM에서는 \(\sigma, \lambda\)만 ELBO 최대화로 추정합니다.
+- 이렇게 하면 문서 2번(KEF+SM + EB)과 수식적으로 일관됩니다.
+
