@@ -115,6 +115,25 @@ build_sigma_derivs <- function(X, sigma, K = NULL) {
   dH <- dH / Tn
   list(dK = dK, dH = dH, db = db)
 }
+
+# --------- 1D normalization helper (for proper density) ---------
+# Given log-unnormalized f(x), return normalized density on grid xs
+# Handles uniform or non-uniform grids robustly.
+dens1d_norm_from_logf <- function(xs, logf){
+  m <- max(logf)
+  u <- exp(logf - m)
+  dx <- diff(xs)
+  if (length(dx) == 0) stop("xs needs length >= 2")
+  if (max(abs(diff(dx))) < 1e-12) {
+    Z <- sum(u) * dx[1]
+  } else {
+    Z <- sum( (u[-1] + u[-length(u)]) / 2 * dx )
+  }
+  (u / Z)
+}
+# convenience wrappers for EB / GBI
+dens1d_eb <- function(fit, xs){ dens1d_norm_from_logf(xs, predict_f_eb(fit, xs)) }
+dens1d_gbi <- function(fit, xs){ dens1d_norm_from_logf(xs, predict_f_gbi(fit, xs)) }
 ```
 
 # 방법 2: EB/VEM (τ=1 고정, jitter = ε 고정)
@@ -284,7 +303,7 @@ fit_gbi <- function(X, sigma_init=NULL, lambda_init=1.0, tau_init=1.0, eps=1e-6,
   lambda <- min(max(lambda_init, lambda_bounds[1]), lambda_bounds[2]); lnlambda <- log(lambda)
   tau <- min(max(tau_init, tau_bounds[1]), tau_bounds[2]); lntau <- log(tau)
   mats <- build_mats(X, sigma)
-  Lcur <- GBI_elbo(mats$K, mats$H, mats$B <- mats$b, lambda, tau, eps)
+  Lcur <- GBI_elbo(mats$K, mats$H, mats$b, lambda, tau, eps)
   for (it in 1:max_iter){
     improved <- FALSE
     gl <- gbi_grad_lambda(mats$K, mats$H, mats$b, lambda, tau, eps)
@@ -348,15 +367,15 @@ X1_mix <- matrix(c(rnorm(150, -2, 0.7), rnorm(150, 2, 0.7)), ncol = 1)
 # EB
 fit_eb <- ebf_fit(X1_mix, eps=1e-6, verbose=TRUE)
 xs <- seq(min(X1_mix)-3, max(X1_mix)+3, length.out=400)
-d_eb <- predict_den_eb(fit_eb, xs)
+d_eb <- dens1d_eb(fit_eb, xs)
 # GBI
 fit_gb <- fit_gbi(X1_mix, eps=1e-6, verbose=TRUE)
-d_gb <- predict_den_gbi(fit_gb, xs)
+d_gb <- dens1d_gbi(fit_gb, xs)
 par(mfrow=c(1,2))
 hist(X1_mix, breaks=30, freq=FALSE, main="EB (τ=1)", xlab="x", col="grey90", border="white")
-lines(xs, d_eb/max(d_eb)*max(hist(X1_mix, breaks=30, plot=FALSE)$density), lwd=2)
+lines(xs, d_eb, lwd=2)
 hist(X1_mix, breaks=30, freq=FALSE, main="GBI (τ optimized)", xlab="x", col="grey90", border="white")
-lines(xs, d_gb/max(d_gb)*max(hist(X1_mix, breaks=30, plot=FALSE)$density), lwd=2)
+lines(xs, d_gb, lwd=2)
 par(mfrow=c(1,1))
 ```
 
@@ -364,19 +383,20 @@ par(mfrow=c(1,1))
 
 ```{r}
 set.seed(102)
+set.seed(102)
 X1_gamma <- matrix(rgamma(300, shape = 2, rate = 1.5), ncol = 1)
 # EB
 fit_eb <- ebf_fit(X1_gamma, eps=1e-6, verbose=TRUE)
 xs <- seq(min(X1_gamma)-1, max(X1_gamma)+1, length.out=400)
-d_eb <- predict_den_eb(fit_eb, xs)
+d_eb <- dens1d_eb(fit_eb, xs)
 # GBI
 fit_gb <- fit_gbi(X1_gamma, eps=1e-6, verbose=TRUE)
-d_gb <- predict_den_gbi(fit_gb, xs)
+d_gb <- dens1d_gbi(fit_gb, xs)
 par(mfrow=c(1,2))
 hist(X1_gamma, breaks=30, freq=FALSE, main="EB (τ=1)", xlab="x", col="grey90", border="white")
-lines(xs, d_eb/max(d_eb)*max(hist(X1_gamma, breaks=30, plot=FALSE)$density), lwd=2)
+lines(xs, d_eb, lwd=2)
 hist(X1_gamma, breaks=30, freq=FALSE, main="GBI (τ optimized)", xlab="x", col="grey90", border="white")
-lines(xs, d_gb/max(d_gb)*max(hist(X1_gamma, breaks=30, plot=FALSE)$density), lwd=2)
+lines(xs, d_gb, lwd=2)
 par(mfrow=c(1,1))
 ```
 
@@ -384,39 +404,21 @@ par(mfrow=c(1,1))
 
 ```{r}
 set.seed(111)
-X1_tri <- matrix(c(rnorm(150, -2, 0.6), rnorm(100, 0, 1.0), rnorm(150, 3, 0.8)), ncol = 1)
-# EB
-fit_eb <- ebf_fit(X1_tri, eps=1e-6, verbose=TRUE)
-xs <- seq(min(X1_tri)-3, max(X1_tri)+3, length.out=500)
-d_eb <- predict_den_eb(fit_eb, xs)
-# GBI
-fit_gb <- fit_gbi(X1_tri, eps=1e-6, verbose=TRUE)
-d_gb <- predict_den_gbi(fit_gb, xs)
-par(mfrow=c(1,2))
-hist(X1_tri, breaks=30, freq=FALSE, main="EB (τ=1)", xlab="x", col="grey90", border="white")
-lines(xs, d_eb/max(d_eb)*max(hist(X1_tri, breaks=30, plot=FALSE)$density), lwd=2)
-hist(X1_tri, breaks=30, freq=FALSE, main="GBI (τ optimized)", xlab="x", col="grey90", border="white")
-lines(xs, d_gb/max(d_gb)*max(hist(X1_tri, breaks=30, plot=FALSE)$density), lwd=2)
-par(mfrow=c(1,1))
-```
-
-## 1D Student-t(ν=3)
-
-```{r}
+set.seed(111)
 set.seed(112)
 X1_t <- matrix(rt(300, df = 3), ncol = 1)
 # EB
 fit_eb <- ebf_fit(X1_t, eps=1e-6, verbose=TRUE)
 xs <- seq(min(X1_t)-3, max(X1_t)+3, length.out=500)
-d_eb <- predict_den_eb(fit_eb, xs)
+d_eb <- dens1d_eb(fit_eb, xs)
 # GBI
 fit_gb <- fit_gbi(X1_t, eps=1e-6, verbose=TRUE)
-d_gb <- predict_den_gbi(fit_gb, xs)
+d_gb <- dens1d_gbi(fit_gb, xs)
 par(mfrow=c(1,2))
 hist(X1_t, breaks=30, freq=FALSE, main="EB (τ=1)", xlab="x", col="grey90", border="white")
-lines(xs, d_eb/max(d_eb)*max(hist(X1_t, breaks=30, plot=FALSE)$density), lwd=2)
+lines(xs, d_eb, lwd=2)
 hist(X1_t, breaks=30, freq=FALSE, main="GBI (τ optimized)", xlab="x", col="grey90", border="white")
-lines(xs, d_gb/max(d_gb)*max(hist(X1_t, breaks=30, plot=FALSE)$density), lwd=2)
+lines(xs, d_gb, lwd=2)
 par(mfrow=c(1,1))
 ```
 
