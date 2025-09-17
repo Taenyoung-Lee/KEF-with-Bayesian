@@ -49,7 +49,6 @@ rbf_kernel <- function(X, sigma) {
   D2 <- as.matrix(dist(X, method = "euclidean"))^2
   exp(- D2 / (2 * sigma^2))
 }
-# ∇_x k at x = x_t, columns = all i
 grad_k_at <- function(x_t, X, sigma) {
   diff <- matrix(x_t, nrow = nrow(X), ncol = ncol(X), byrow = TRUE) - X
   r2   <- rowSums(diff^2)
@@ -57,7 +56,6 @@ grad_k_at <- function(x_t, X, sigma) {
   Gcols <- - (diff / sigma^2) * kvec
   t(Gcols)
 }
-# Δ_x k at x = x_t, vector over i
 laplacian_k_at <- function(x_t, X, sigma) {
   d <- ncol(X)
   diff <- matrix(x_t, nrow = nrow(X), ncol = ncol(X), byrow = TRUE) - X
@@ -65,7 +63,6 @@ laplacian_k_at <- function(x_t, X, sigma) {
   kvec <- exp(- r2 / (2 * sigma^2))
   (-d / sigma^2 + r2 / sigma^4) * kvec
 }
-# σ-derivatives (for σ updates)
 dK_dsigma <- function(X, sigma, K_precomp = NULL) {
   if (is.null(K_precomp)) K_precomp <- rbf_kernel(X, sigma)
   D2 <- as.matrix(dist(X, method = "euclidean"))^2
@@ -87,26 +84,45 @@ dlap_k_dsigma_at <- function(x_t, X, sigma) {
   kvec * ( (2*d)/sigma^3 - ((d+4)*r2)/sigma^5 + (r2^2)/sigma^7 )
 }
 
-# --------- Build H, b, (and σ-derivs) ---------
-build_mats <- function(X, sigma) {
+# --- NEW: Score function for a standard Gaussian basis density p0 ---
+# For standardized data, p0 ~ N(0, I) is a good choice. Its score is -x.
+score_p0_gaussian <- function(x) {
+  -x
+}
+
+
+# --- MODIFIED: Build H, b, incorporating the score of p0 ---
+build_mats <- function(X, sigma, score_p0 = NULL) {
   Tn <- nrow(X)
   K <- rbf_kernel(X, sigma)
   H <- matrix(0, Tn, Tn)
   b <- numeric(Tn)
+  b_p0 <- numeric(Tn) # Component from the basis density p0
+
   for (t in 1:Tn) {
-    Gt <- grad_k_at(X[t, , drop = FALSE], X, sigma)     # d x T
-    H  <- H + crossprod(Gt)                             # T x T
-    b  <- b + laplacian_k_at(X[t, , drop = FALSE], X, sigma)
+    x_t <- X[t, , drop = FALSE]
+    Gt <- grad_k_at(x_t, X, sigma)      # d x T matrix
+    H  <- H + crossprod(Gt)             # T x T
+    b  <- b + laplacian_k_at(x_t, X, sigma)
+    
+    # If a score function for p0 is provided, calculate its contribution
+    if (!is.null(score_p0)) {
+      s0_at_xt <- score_p0(x_t) # This is a 1 x d vector
+      # Add the term E[∇f(x)ᵀs₀(x)], which is linear in α
+      b_p0 <- b_p0 + as.numeric(crossprod(Gt, t(s0_at_xt)))
+    }
   }
   H <- H / Tn
-  list(K = K, H = H, b = b)
+  
+  list(K = K, H = H, b = b + b_p0) # Add the new component to b
 }
+
 build_sigma_derivs <- function(X, sigma, K = NULL) {
   Tn <- nrow(X)
   if (is.null(K)) K <- rbf_kernel(X, sigma)
   dK <- dK_dsigma(X, sigma, K)
   dH <- matrix(0, Tn, Tn)
-  db <- numeric(Tn)
+  db <- numeric(Tn) # Note: sigma-deriv of b_p0 is not implemented for simplicity
   for (t in 1:Tn) {
     dGt <- dgrad_k_dsigma_at(X[t, , drop = FALSE], X, sigma)
     dH  <- dH + crossprod(dGt)
@@ -116,9 +132,7 @@ build_sigma_derivs <- function(X, sigma, K = NULL) {
   list(dK = dK, dH = dH, db = db)
 }
 
-# --------- 1D normalization helper (for proper density) ---------
-# Given log-unnormalized f(x), return normalized density on grid xs
-# Handles uniform or non-uniform grids robustly.
+# --------- 1D normalization helper ---------
 dens1d_norm_from_logf <- function(xs, logf){
   m <- max(logf)
   u <- exp(logf - m)
@@ -131,7 +145,6 @@ dens1d_norm_from_logf <- function(xs, logf){
   }
   (u / Z)
 }
-# convenience wrappers for EB / GBI
 dens1d_eb <- function(fit, xs){ dens1d_norm_from_logf(xs, predict_f_eb(fit, xs)) }
 dens1d_gbi <- function(fit, xs){ dens1d_norm_from_logf(xs, predict_f_gbi(fit, xs)) }
 ```
@@ -139,7 +152,6 @@ dens1d_gbi <- function(fit, xs){ dens1d_norm_from_logf(xs, predict_f_gbi(fit, xs
 # 방법 2: EB/VEM (τ=1 고정, jitter = ε 고정)
 
 ```{r}
-# ELBO with Q = lambda*K + eps*I, A = H + Q
 en_elbo_value <- function(K, H, b, lambda, eps) {
   Tn <- length(b)
   Q <- lambda * K + diag(eps, Tn)
@@ -148,7 +160,6 @@ en_elbo_value <- function(K, H, b, lambda, eps) {
   0.5*logdet_from_chol(LQ) - 0.5*logdet_from_chol(LA) +
     0.5 * as.numeric(crossprod(b, chol_solve(LA, b))) / (Tn^2)
 }
-# grads wrt sigma & lambda
 en_grad_sigma <- function(K, H, b, lambda, eps, dK, dH, db) {
   Tn <- length(b)
   Q <- lambda*K + diag(eps, Tn); A <- H + Q
@@ -169,29 +180,34 @@ en_grad_lambda <- function(K, H, b, lambda, eps) {
   Ainv_b <- chol_solve(LA, b)
   0.5*tr1 - 0.5*tr2 - (1/(2*Tn^2))*as.numeric(crossprod(Ainv_b, K %*% Ainv_b))
 }
-# closed-form posterior mean alpha (EB)
 solve_alpha_eb <- function(H, K, b, lambda, eps, Tn){
   A <- H + lambda*K + diag(eps, Tn)
   LA <- safe_chol(A)
   alpha <- -(1/Tn) * chol_solve(LA, b)
   list(alpha = alpha, cholA = LA)
 }
-# fit (σ, λ), ε fixed
+
+# --- MODIFIED: ebf_fit to accept score_p0 ---
 ebf_fit <- function(X, sigma_init=NULL, lambda_init=1.0, eps=1e-6,
                     max_iter=200, tol=1e-4, step_sigma=0.3, step_lambda=0.3,
                     standardize=TRUE, sigma_clip_factor=c(0.2,5.0),
-                    lambda_bounds=c(1e-8,1e6), verbose=FALSE){
+                    lambda_bounds=c(1e-8,1e6), score_p0=NULL, verbose=FALSE){
   X <- as.matrix(X); Tn <- nrow(X); d <- ncol(X)
-  if (standardize){ x_center <- colMeans(X); x_scale <- apply(X,2,sd);
+  if (standardize){ 
+    x_center <- colMeans(X); x_scale <- apply(X,2,sd);
     x_scale[!is.finite(x_scale)|x_scale==0] <- 1
     X <- scale(X, center=x_center, scale=x_scale)
-  } else { x_center <- rep(0,d); x_scale <- rep(1,d) }
+  } else { 
+    x_center <- rep(0,d); x_scale <- rep(1,d) 
+  }
   D <- as.matrix(dist(X)); med_d <- median(D[D>0]); if(!is.finite(med_d)||med_d<=0) med_d <- 1
   smin <- sigma_clip_factor[1]*med_d; smax <- sigma_clip_factor[2]*med_d
   sigma <- if(is.null(sigma_init)) med_d else sigma_init
   sigma <- min(max(sigma,smin),smax); lnsigma <- log(sigma)
   lambda <- min(max(lambda_init, lambda_bounds[1]), lambda_bounds[2]); lnlambda <- log(lambda)
-  mats <- build_mats(X, sigma)
+  
+  mats <- build_mats(X, sigma, score_p0)
+  
   Lcur <- en_elbo_value(mats$K, mats$H, mats$b, lambda, eps)
   for (it in 1:max_iter){
     improved <- FALSE
@@ -209,7 +225,7 @@ ebf_fit <- function(X, sigma_init=NULL, lambda_init=1.0, eps=1e-6,
     for (ls in 1:20){
       sigma_try <- exp(lnsigma + step*g)
       sigma_try <- min(max(sigma_try, smin), smax)
-      mats_try <- build_mats(X, sigma_try)
+      mats_try <- build_mats(X, sigma_try, score_p0)
       Ltry <- en_elbo_value(mats_try$K, mats_try$H, mats_try$b, lambda, eps)
       if (is.finite(Ltry) && Ltry >= Lcur - 1e-12){ sigma<-sigma_try; lnsigma<-log(sigma); mats<-mats_try; Lcur<-Ltry; improved<-TRUE; break } else step <- step/2
     }
@@ -217,22 +233,29 @@ ebf_fit <- function(X, sigma_init=NULL, lambda_init=1.0, eps=1e-6,
   }
   sol <- solve_alpha_eb(mats$H, mats$K, mats$b, lambda, eps, Tn)
   list(X=X, sigma=sigma, lambda=lambda, eps=eps, elbo=Lcur, alpha=sol$alpha,
-       H=mats$H, K=mats$K, b=mats$b, x_center=if(exists("x_center")) x_center else NULL,
-       x_scale=if(exists("x_scale")) x_scale else NULL, standardize=standardize)
+       H=mats$H, K=mats$K, b=mats$b, x_center=x_center, x_scale=x_scale, 
+       standardize=standardize, score_p0=score_p0)
 }
 # predict (EB)
 predict_f_eb <- function(fit, Xnew){
   Xnew <- as.matrix(Xnew)
+  log_p0_val <- 0
   if (isTRUE(fit$standardize)){
-    Xnew <- sweep(Xnew, 2, fit$x_center, "-")
-    Xnew <- sweep(Xnew, 2, fit$x_scale,  "/")
+    Xnew_std <- sweep(Xnew, 2, fit$x_center, "-")
+    Xnew_std <- sweep(Xnew_std, 2, fit$x_scale,  "/")
+  } else {
+    Xnew_std <- Xnew
   }
-  Tn <- nrow(fit$X); out <- matrix(0, nrow(Xnew), Tn)
-  for (i in 1:nrow(Xnew)){
-    diff <- sweep(fit$X, 2, Xnew[i,], FUN="-"); r2 <- rowSums(diff^2)
+  if (!is.null(fit$score_p0)) {
+      # Assuming p0 is N(0,I), log p0(x) = -0.5 * sum(x^2) + C
+      log_p0_val <- -0.5 * rowSums(Xnew_std^2)
+  }
+  Tn <- nrow(fit$X); out <- matrix(0, nrow(Xnew_std), Tn)
+  for (i in 1:nrow(Xnew_std)){
+    diff <- sweep(fit$X, 2, Xnew_std[i,], FUN="-"); r2 <- rowSums(diff^2)
     out[i,] <- exp(- r2 / (2 * fit$sigma^2))
   }
-  as.numeric(out %*% fit$alpha)
+  as.numeric(out %*% fit$alpha) + log_p0_val
 }
 predict_den_eb <- function(fit, Xnew) exp(predict_f_eb(fit, Xnew))
 ```
@@ -240,7 +263,6 @@ predict_den_eb <- function(fit, Xnew) exp(predict_f_eb(fit, Xnew))
 # 방법 1: GBI (τ 최적화, jitter = ε 고정)
 
 ```{r}
-# GBI ELBO with Q=lambda*K+eps*I, R=tau*H + Q
 GBI_elbo <- function(K, H, b, lambda, tau, eps){
   Tn <- length(b)
   Q <- lambda*K + diag(eps, Tn)
@@ -249,7 +271,6 @@ GBI_elbo <- function(K, H, b, lambda, tau, eps){
   0.5*logdet_from_chol(LQ) - 0.5*logdet_from_chol(LR) +
     0.5 * (tau^2/Tn^2) * as.numeric(crossprod(b, chol_solve(LR, b)))
 }
-# grads
 gbi_grad_lambda <- function(K, H, b, lambda, tau, eps){
   Tn <- length(b)
   Q <- lambda*K + diag(eps,Tn); R <- tau*H + Q
@@ -280,29 +301,35 @@ gbi_grad_sigma <- function(K, H, b, lambda, tau, eps, dK, dH, db){
   tmp    <- chol_solve(LR, dR %*% Rinv_b)
   0.5*tr_Q - 0.5*tr_R + (tau^2/(2*Tn^2))*(2*sum(db*Rinv_b) - as.numeric(crossprod(b, tmp)))
 }
-# posterior mean m = -(tau/T) R^{-1} b
 solve_post_gbi <- function(H, K, b, lambda, tau, eps, Tn){
   R <- tau*H + lambda*K + diag(eps, Tn)
   LR <- safe_chol(R)
   m <- -(tau/Tn) * chol_solve(LR, b)
   list(m=m, cholR=LR)
 }
-# fit (σ, λ, τ)
+
+# --- MODIFIED: fit_gbi to accept score_p0 ---
 fit_gbi <- function(X, sigma_init=NULL, lambda_init=1.0, tau_init=1.0, eps=1e-6,
                     max_iter=200, tol=1e-4, step_sigma=0.2, step_lambda=0.2, step_tau=0.2,
                     standardize=TRUE, sigma_clip_factor=c(0.2,5.0),
-                    lambda_bounds=c(1e-8,1e6), tau_bounds=c(1e-3,1e3), verbose=FALSE){
+                    lambda_bounds=c(1e-8,1e6), tau_bounds=c(1e-3,1e3), 
+                    score_p0=NULL, verbose=FALSE){
   X <- as.matrix(X); Tn <- nrow(X); d <- ncol(X)
-  if (standardize){ x_center <- colMeans(X); x_scale <- apply(X,2,sd);
+  if (standardize){ 
+    x_center <- colMeans(X); x_scale <- apply(X,2,sd);
     x_scale[!is.finite(x_scale)|x_scale==0] <- 1; X <- scale(X, center=x_center, scale=x_scale)
-  } else { x_center <- rep(0,d); x_scale <- rep(1,d) }
+  } else { 
+    x_center <- rep(0,d); x_scale <- rep(1,d) 
+  }
   D <- as.matrix(dist(X)); med_d <- median(D[D>0]); if(!is.finite(med_d)||med_d<=0) med_d <- 1
   smin <- sigma_clip_factor[1]*med_d; smax <- sigma_clip_factor[2]*med_d
   sigma <- if(is.null(sigma_init)) med_d else sigma_init
   sigma <- min(max(sigma,smin),smax); lnsigma <- log(sigma)
   lambda <- min(max(lambda_init, lambda_bounds[1]), lambda_bounds[2]); lnlambda <- log(lambda)
   tau <- min(max(tau_init, tau_bounds[1]), tau_bounds[2]); lntau <- log(tau)
-  mats <- build_mats(X, sigma)
+
+  mats <- build_mats(X, sigma, score_p0)
+  
   Lcur <- GBI_elbo(mats$K, mats$H, mats$b, lambda, tau, eps)
   for (it in 1:max_iter){
     improved <- FALSE
@@ -328,7 +355,7 @@ fit_gbi <- function(X, sigma_init=NULL, lambda_init=1.0, tau_init=1.0, eps=1e-6,
     for (ls in 1:20){
       sigma_try <- exp(lnsigma + step*g)
       sigma_try <- min(max(sigma_try, smin), smax)
-      mats_try <- build_mats(X, sigma_try)
+      mats_try <- build_mats(X, sigma_try, score_p0)
       Ltry <- GBI_elbo(mats_try$K, mats_try$H, mats_try$b, lambda, tau, eps)
       if (is.finite(Ltry) && Ltry >= Lcur - 1e-12){ sigma<-sigma_try; lnsigma<-log(sigma); mats<-mats_try; Lcur<-Ltry; improved<-TRUE; break } else step <- step/2
     }
@@ -336,21 +363,30 @@ fit_gbi <- function(X, sigma_init=NULL, lambda_init=1.0, tau_init=1.0, eps=1e-6,
   }
   post <- solve_post_gbi(mats$H, mats$K, mats$b, lambda, tau, eps, Tn)
   list(X=X, sigma=sigma, lambda=lambda, tau=tau, eps=eps, elbo=Lcur, m=post$m,
-       H=mats$H, K=mats$K, b=mats$b, x_center=x_center, x_scale=x_scale, standardize=standardize)
+       H=mats$H, K=mats$K, b=mats$b, x_center=x_center, x_scale=x_scale, 
+       standardize=standardize, score_p0=score_p0)
 }
+
 # predict (GBI)
 predict_f_gbi <- function(fit, Xnew){
   Xnew <- as.matrix(Xnew)
+  log_p0_val <- 0
   if (isTRUE(fit$standardize)){
-    Xnew <- sweep(Xnew, 2, fit$x_center, "-")
-    Xnew <- sweep(Xnew, 2, fit$x_scale,  "/")
+    Xnew_std <- sweep(Xnew, 2, fit$x_center, "-")
+    Xnew_std <- sweep(Xnew_std, 2, fit$x_scale,  "/")
+  } else {
+    Xnew_std <- Xnew
   }
-  Tn <- nrow(fit$X); out <- matrix(0, nrow(Xnew), Tn)
-  for (i in 1:nrow(Xnew)){
-    diff <- sweep(fit$X, 2, Xnew[i,], FUN="-"); r2 <- rowSums(diff^2)
+  if (!is.null(fit$score_p0)) {
+      # Assuming p0 is N(0,I), log p0(x) = -0.5 * sum(x^2) + C
+      log_p0_val <- -0.5 * rowSums(Xnew_std^2)
+  }
+  Tn <- nrow(fit$X); out <- matrix(0, nrow(Xnew_std), Tn)
+  for (i in 1:nrow(Xnew_std)){
+    diff <- sweep(fit$X, 2, Xnew_std[i,], FUN="-"); r2 <- rowSums(diff^2)
     out[i,] <- exp(- r2 / (2 * fit$sigma^2))
   }
-  as.numeric(out %*% fit$m)
+  as.numeric(out %*% fit$m) + log_p0_val
 }
 predict_den_gbi <- function(fit, Xnew) exp(predict_f_gbi(fit, Xnew))
 ```
@@ -364,39 +400,44 @@ predict_den_gbi <- function(fit, Xnew) exp(predict_f_gbi(fit, Xnew))
 ```{r}
 set.seed(101)
 X1_mix <- matrix(c(rnorm(150, -2, 0.7), rnorm(150, 2, 0.7)), ncol = 1)
-# EB
-fit_eb <- ebf_fit(X1_mix, eps=1e-6, verbose=TRUE)
+
+# EB with p0
+fit_eb <- ebf_fit(X1_mix, eps=1e-6, score_p0 = score_p0_gaussian)
 xs <- seq(min(X1_mix)-3, max(X1_mix)+3, length.out=400)
 d_eb <- dens1d_eb(fit_eb, xs)
-# GBI
-fit_gb <- fit_gbi(X1_mix, eps=1e-6, verbose=TRUE)
+
+# GBI with p0
+fit_gb <- fit_gbi(X1_mix, eps=1e-6, score_p0 = score_p0_gaussian)
 d_gb <- dens1d_gbi(fit_gb, xs)
+
 par(mfrow=c(1,2))
-hist(X1_mix, breaks=30, freq=FALSE, main="EB (τ=1)", xlab="x", col="grey90", border="white")
-lines(xs, d_eb, lwd=2)
-hist(X1_mix, breaks=30, freq=FALSE, main="GBI (τ optimized)", xlab="x", col="grey90", border="white")
-lines(xs, d_gb, lwd=2)
+hist(X1_mix, breaks=30, freq=FALSE, main="EB with p0=N(0,1)", xlab="x", col="grey90", border="white")
+lines(xs, d_eb, lwd=2, col="blue")
+hist(X1_mix, breaks=30, freq=FALSE, main="GBI with p0=N(0,1)", xlab="x", col="grey90", border="white")
+lines(xs, d_gb, lwd=2, col="red")
 par(mfrow=c(1,1))
 ```
-
 ## 1D Gamma (Asymmetric)
 
 ```{r}
 set.seed(102)
 set.seed(102)
 X1_gamma <- matrix(rgamma(300, shape = 2, rate = 1.5), ncol = 1)
-# EB
-fit_eb <- ebf_fit(X1_gamma, eps=1e-6, verbose=TRUE)
-xs <- seq(min(X1_gamma)-1, max(X1_gamma)+1, length.out=400)
+
+# EB with p0
+fit_eb <- ebf_fit(X1_gamma, eps=1e-6, score_p0 = score_p0_gaussian)
+xs <- seq(min(X1_gamma)-3, max(X1_gamma)+3, length.out=400)
 d_eb <- dens1d_eb(fit_eb, xs)
-# GBI
-fit_gb <- fit_gbi(X1_gamma, eps=1e-6, verbose=TRUE)
+
+# GBI with p0
+fit_gb <- fit_gbi(X1_gamma, eps=1e-6, score_p0 = score_p0_gaussian)
 d_gb <- dens1d_gbi(fit_gb, xs)
+
 par(mfrow=c(1,2))
-hist(X1_gamma, breaks=30, freq=FALSE, main="EB (τ=1)", xlab="x", col="grey90", border="white")
-lines(xs, d_eb, lwd=2)
-hist(X1_gamma, breaks=30, freq=FALSE, main="GBI (τ optimized)", xlab="x", col="grey90", border="white")
-lines(xs, d_gb, lwd=2)
+hist(X1_gamma, breaks=30, freq=FALSE, main="EB with p0=N(0,1)", xlab="x", col="grey90", border="white")
+lines(xs, d_eb, lwd=2, col="blue")
+hist(X1_gamma, breaks=30, freq=FALSE, main="GBI with p0=N(0,1)", xlab="x", col="grey90", border="white")
+lines(xs, d_gb, lwd=2, col="red")
 par(mfrow=c(1,1))
 ```
 
@@ -407,18 +448,21 @@ set.seed(111)
 set.seed(111)
 set.seed(112)
 X1_t <- matrix(rt(300, df = 3), ncol = 1)
-# EB
-fit_eb <- ebf_fit(X1_t, eps=1e-6, verbose=TRUE)
-xs <- seq(min(X1_t)-3, max(X1_t)+3, length.out=500)
+
+# EB with p0
+fit_eb <- ebf_fit(X1_t, eps=1e-6, score_p0 = score_p0_gaussian)
+xs <- seq(min(X1_t)-3, max(X1_t)+3, length.out=400)
 d_eb <- dens1d_eb(fit_eb, xs)
-# GBI
-fit_gb <- fit_gbi(X1_t, eps=1e-6, verbose=TRUE)
+
+# GBI with p0
+fit_gb <- fit_gbi(X1_t, eps=1e-6, score_p0 = score_p0_gaussian)
 d_gb <- dens1d_gbi(fit_gb, xs)
+
 par(mfrow=c(1,2))
-hist(X1_t, breaks=30, freq=FALSE, main="EB (τ=1)", xlab="x", col="grey90", border="white")
-lines(xs, d_eb, lwd=2)
-hist(X1_t, breaks=30, freq=FALSE, main="GBI (τ optimized)", xlab="x", col="grey90", border="white")
-lines(xs, d_gb, lwd=2)
+hist(X1_t, breaks=30, freq=FALSE, main="EB with p0=N(0,1)", xlab="x", col="grey90", border="white")
+lines(xs, d_eb, lwd=2, col="blue")
+hist(X1_t, breaks=30, freq=FALSE, main="GBI with p0=N(0,1)", xlab="x", col="grey90", border="white")
+lines(xs, d_gb, lwd=2, col="red")
 par(mfrow=c(1,1))
 ```
 
@@ -443,18 +487,38 @@ plot_density_2d <- function(X, fit, pred_fun, main_title, grid_n=120){
 ## 2D Banana Shape
 
 ```{r}
+# 2D 시각화 도우미
+plot_density_2d <- function(X, fit, pred_fun, main_title, grid_n=120){
+  # 원본 데이터 스케일로 시각화하기 위해 x_center와 x_scale을 사용
+  X_orig <- sweep(fit$X, 2, fit$x_scale, "*")
+  X_orig <- sweep(X_orig, 2, fit$x_center, "+")
+  
+  rng <- apply(X_orig, 2, range)
+  gx <- seq(rng[1,1]-1, rng[2,1]+1, length.out=grid_n)
+  gy <- seq(rng[1,2]-1, rng[2,2]+1, length.out=grid_n)
+  G <- expand.grid(gx, gy)
+  
+  den <- pred_fun(fit, as.matrix(G)); den <- matrix(den, grid_n, grid_n)
+  
+  image(gx, gy, den, main=main_title, xlab="x1", ylab="x2", col = viridisLite::viridis(256))
+  points(X_orig, pch=16, cex=0.4, col="white")
+  contour(gx, gy, den, add=TRUE, drawlabels=FALSE, col="white")
+}
+
 set.seed(201)
 n_banana <- 400
 x_b <- rnorm(n_banana, 0, 1.5)
 y_b <- x_b^2 + rnorm(n_banana, 0, 0.8)
 X2_banana <- cbind(x_b, y_b)
-# EB
-fit_eb <- ebf_fit(X2_banana, eps=1e-6, verbose=TRUE)
+
+# EB with p0
+fit_eb_banana <- ebf_fit(X2_banana, eps=1e-6, score_p0 = score_p0_gaussian)
+# GBI with p0
+fit_gb_banana <- fit_gbi(X2_banana, eps=1e-6, score_p0 = score_p0_gaussian)
+
 par(mfrow=c(1,2))
-plot_density_2d(X2_banana, fit_eb, predict_den_eb, "EB (τ=1)")
-# GBI
-fit_gb <- fit_gbi(X2_banana, eps=1e-6, verbose=TRUE)
-plot_density_2d(X2_banana, fit_gb, predict_den_gbi, "GBI (τ optimized)")
+plot_density_2d(X2_banana, fit_eb_banana, predict_den_eb, "EB with p0=N(0,I)")
+plot_density_2d(X2_banana, fit_gb_banana, predict_den_gbi, "GBI with p0=N(0,I)")
 par(mfrow=c(1,1))
 ```
 
