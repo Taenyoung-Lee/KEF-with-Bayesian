@@ -260,6 +260,10 @@ ebf_fit <- function(X, sigma_init=NULL, lambda_init=1.0, eps=1e-6,
 
   mats <- build_mats(X, sigma, score_p0)
   Lcur <- en_elbo_value(mats$K, mats$H, mats$b, lambda, eps)
+  # [NEW] ELBO history 초기화 (iter=0: 초기값)
+  eb_hist <- data.frame(iter = 0L, elbo = Lcur,
+                        sigma = sigma, lambda = lambda,
+                        stringsAsFactors = FALSE)
 
   for (it in 1:max_iter){
     improved <- FALSE
@@ -289,11 +293,16 @@ ebf_fit <- function(X, sigma_init=NULL, lambda_init=1.0, eps=1e-6,
     }
     if (!improved) break
     if (max(abs(g), abs(gl*lambda*step_lambda)) < tol) break
+    # [NEW] 바깥 반복 1회가 끝날 때 현재 값 기록
+    eb_hist <- rbind(eb_hist, data.frame(iter = it, elbo = Lcur,
+                                         sigma = sigma, lambda = lambda))
   }
   sol <- solve_alpha_eb(mats$H, mats$K, mats$b, lambda, eps, Tn)
   list(X=X, sigma=sigma, lambda=lambda, eps=eps, elbo=Lcur, alpha=sol$alpha,
        H=mats$H, K=mats$K, b=mats$b, x_center=x_center, x_scale=x_scale,
-       standardize=standardize, score_p0=score_p0)
+       standardize=standardize, score_p0=score_p0,
+       # [NEW] 히스토리 반환
+       history = eb_hist)
 }
 
 predict_f_eb  <- function(fit, Xnew, jacobian_correction = FALSE){
@@ -381,7 +390,7 @@ solve_post_gbi <- function(H, K, b, lambda, tau, eps, Tn, return_cov = FALSE, di
 fit_gbi <- function(X, sigma_init=NULL, lambda_init=1.0, tau_init=1.0, eps=1e-6,
                     max_iter=200, tol=1e-4, step_sigma=0.2, step_tau=0.2, step_lambda=0.25,
                     standardize=TRUE, sigma_clip_factor=c(0.2,5.0),
-                    tau_bounds=c(1e-3,1e3), lambda_bounds=c(1e-8,1e6),
+                    tau_bounds=c(1e-1,1e1), lambda_bounds=c(1e-4,1e4),
                     score_p0=NULL, optimize_lambda=FALSE, verbose=FALSE){
   X <- as.matrix(X); Tn <- nrow(X); d <- ncol(X)
   if (standardize){
@@ -398,6 +407,11 @@ fit_gbi <- function(X, sigma_init=NULL, lambda_init=1.0, tau_init=1.0, eps=1e-6,
 
   mats <- build_mats(X, sigma, score_p0)
   Lcur <- GBI_elbo(mats$K, mats$H, mats$b, lambda, tau, eps)
+  # [NEW] ELBO history 초기화 (iter=0: 초기값)
+  gbi_hist <- data.frame(iter = 0L, elbo = Lcur,
+                         sigma = sigma, tau = tau, lambda = lambda,
+                         stringsAsFactors = FALSE)
+
 
   for (it in 1:max_iter){
     improved <- FALSE
@@ -441,6 +455,9 @@ fit_gbi <- function(X, sigma_init=NULL, lambda_init=1.0, tau_init=1.0, eps=1e-6,
     if (!improved) break
     if (max(abs(gt*tau*step_tau), abs(gs*sigma*step_sigma),
             if (optimize_lambda) abs(gl*lambda*step_lambda) else 0) < tol) break
+     # [NEW] 바깥 반복 1회가 끝날 때 현재 값 기록
+    gbi_hist <- rbind(gbi_hist, data.frame(iter = it, elbo = Lcur,
+                                           sigma = sigma, tau = tau, lambda = lambda))
   }
   post <- solve_post_gbi(mats$H, mats$K, mats$b, lambda, tau, eps, Tn,
                          return_cov = TRUE, diag_only = TRUE)
@@ -448,7 +465,9 @@ fit_gbi <- function(X, sigma_init=NULL, lambda_init=1.0, tau_init=1.0, eps=1e-6,
     X=X, sigma=sigma, lambda=lambda, tau=tau, eps=eps, elbo=Lcur, m=post$m,
     H=mats$H, K=mats$K, b=mats$b, x_center=x_center, x_scale=x_scale,
     standardize=standardize, score_p0=score_p0,
-    cholR = post$cholR, S_diag = post$S_diag
+    cholR = post$cholR, S_diag = post$S_diag,
+    # [NEW] 히스토리 반환
+    history = gbi_hist
   )
 }
 
@@ -595,7 +614,33 @@ plot_density_with_variance <- function(
        main = "Pointwise sd of log f(x)")
 }
 
+# 한 줄 플로터: iteration vs ELBO
+plot_elbo_trace <- function(hist, main = "ELBO over iterations") {
+  y <- hist$elbo
+  #yrel <- y - max(y, na.rm = TRUE)  # 최댓값을 0으로 정규화(상대 비교 편함)
+  yrel <- y #상대비교 x
+  plot(hist$iter, yrel, type = "b", lwd = 2, pch = 19,
+       xlab = "iteration", ylab = "ELBO", main = main)
+  abline(h = 0, lty = 2)
+}
 
+plot_elbo_and_params <- function(hist, main = "ELBO + params") {
+  op <- par(mfrow = c(1,2))
+  plot_elbo_trace(hist, main = paste(main, "- ELBO"))
+  matplot(hist$iter, cbind(log10(hist$sigma),
+                           if ("tau" %in% names(hist)) log10(hist$tau) else NA,
+                           log10(hist$lambda)),
+          type = "l", lwd = 2, lty = 1,
+          xlab = "iteration", ylab = "log10(params)",
+          main = paste(main, "- params"))
+  legend("topright",
+         legend = c("log10(sigma)",
+                    if ("tau" %in% names(hist)) "log10(tau)" else NULL,
+                    "log10(lambda)"),
+         col = 1:3, lty = 1, lwd = 2, bty = "n", cex = 0.9)
+  par(op)
+}
+# 사용 예: plot_elbo_and_params(fit_gb$history, "GBI (bimodal)")
 
 ```
 ## Simulation
@@ -645,12 +690,14 @@ plot_density_with_variance(
   X1_mix, xs, f_eb, varf_eb, main = ttl_eb, line_col = "blue",
   true_xs = xs, true_den = d_true
 )
+#plot_elbo_and_params(fit_eb$history, "EB (bimodal)")
+plot_elbo_trace(fit_eb$history, main = "EB (bimodal) ELBO")
 plot_density_with_variance(
   X1_mix, xs, f_gb, varf_gb, main = ttl_gb, line_col = "red",
   true_xs = xs, true_den = d_true
 )
-
-
+#plot_elbo_and_params(fit_gb$history, "GBI (bimodal)")
+plot_elbo_trace(fit_gb$history, main = "GBI (bimodal) ELBO")
 
 ```
 
@@ -703,12 +750,14 @@ plot_density_with_variance(
   X1_gamma, xs, f_eb, varf_eb, main = ttl_eb, line_col = "blue",
   true_xs = xs, true_den = d_true
 )
+#plot_elbo_and_params(fit_eb$history, "EB (gamma)")
+plot_elbo_trace(fit_eb$history, main = "EB (gamma) ELBO")
 plot_density_with_variance(
   X1_gamma, xs, f_gb, varf_gb, main = ttl_gb, line_col = "red",
   true_xs = xs, true_den = d_true
 )
-
-
+#plot_elbo_and_params(fit_gb$history, "GBI (gamma)")
+plot_elbo_trace(fit_gb$history, main = "GBI (gamma) ELBO")
 ```
 
 
