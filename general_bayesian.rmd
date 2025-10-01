@@ -400,7 +400,7 @@ fit <- fit_gbi(X,
                lambda_init = 1.0,
                tau_init = 1.0,
                epsilon = 1e-6,
-               max_iter = 200,
+               max_iter = 20,
                tol = 1e-5,
                verbose = TRUE,
                standardize = TRUE)
